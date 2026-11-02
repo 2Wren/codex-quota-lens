@@ -101,15 +101,21 @@
     const [y, m, d] = String(key || "").slice(0, 10).split("-").map(Number);
     return y && m && d ? Date.UTC(y, m - 1, d) : NaN;
   };
+  // 官网的 ends_at 比 wham 的 reset_at 早几百毫秒，按分钟四舍五入，两边才显示成同一时刻
+  const toMinute = (ms) => new Date(Math.round(n(ms) / 60000) * 60000);
+  const hhmm = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   const fmtTime = (ms) => {
-    const d = new Date(ms);
-    if (!Number.isFinite(d.getTime())) return "未知";
-    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if (!Number.isFinite(Number(ms))) return "未知";
+    const d = toMinute(ms);
+    return `${d.getMonth() + 1}/${d.getDate()} ${hhmm(d)}`;
   };
   const fmtClock = (ms) => {
-    const d = new Date(ms);
-    const sameDay = new Date().toDateString() === d.toDateString();
-    return sameDay ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : fmtTime(ms);
+    const d = toMinute(ms);
+    return new Date().toDateString() === d.toDateString() ? hhmm(d) : fmtTime(ms);
+  };
+  const fmtSpan = (start, end) => {
+    const sameDay = toMinute(start).toDateString() === toMinute(end).toDateString();
+    return `${fmtTime(start)} – ${sameDay ? hhmm(toMinute(end)) : fmtTime(end)}`;
   };
   const fmtDay = (key) => {
     const [, m, d] = String(key).split("-");
@@ -856,7 +862,7 @@
       .map(
         (p) => `
         <div class="ql-list-row${p === v.currentPeriod ? " is-current" : ""}">
-          <span class="ql-label">${esc(fmtWindow(p.minutes))}<small>${esc(fmtTime(p.start))} – ${esc(fmtTime(p.end))}</small></span>
+          <span class="ql-label">${esc(fmtWindow(p.minutes))}<small>${esc(fmtSpan(p.start, p.end))}</small></span>
           ${mini(p.used, p === v.currentPeriod ? "var(--accent)" : "var(--ink)")}
           <span class="ql-val">${fmtPct(p.used)}</span>
           <span class="ql-extra">${
@@ -874,11 +880,14 @@
           <span class="ql-label">${esc(l.name)}<small>${esc(fmtWindow(l.minutes))}，独立计算</small></span>
           ${mini(l.used, "var(--ink)")}
           <span class="ql-val">${fmtPct(l.used)}</span>
-          <span class="ql-extra">${Number.isFinite(l.reset) ? `${esc(fmtTime(l.reset))} 重置` : ""}</span>
+          <span class="ql-extra">${Number.isFinite(l.reset) ? `${esc(fmtClock(l.reset))} 重置` : ""}</span>
         </div>`),
     );
     if (!rows.length) return "";
-    const body = `<p class="ql-hint ql-fold-hint">来自官网「套餐用量历史」，结算截至 ${esc(fmtTime(v.asOf))}。进行中的窗口还会继续增长；「未核完」是官方对个别已结束窗口的标记，多见于用超 100% 的窗口。</p><div class="ql-list ql-list-windows">${rows.join("")}</div>`;
+    const hint = v.periods.length
+      ? `来自官网「套餐用量历史」${Number.isFinite(v.asOf) ? `，结算截至 ${esc(fmtTime(v.asOf))}` : ""}。进行中的窗口还会继续增长；「未核完」是官方对个别已结束窗口的标记，多见于用超 100% 的窗口。`
+      : "没读到官网的套餐用量历史，这里只列出单独计算的限额。";
+    const body = `<p class="ql-hint ql-fold-hint">${hint}</p><div class="ql-list ql-list-windows">${rows.join("")}</div>`;
     return fold("windows", "额度窗口", `${rows.length} 个`, body, folds);
   };
 
@@ -1279,13 +1288,14 @@ html.dark #cql-root, html.dark #cql-launch {
   display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(70px, 1fr) 64px 72px; align-items: center; gap: 14px;
   padding: 8px 0; font-size: 13px; font-variant-numeric: tabular-nums;
 }
+#cql-root .ql-list-windows .ql-list-row { grid-template-columns: minmax(0, 1.4fr) minmax(70px, 1fr) 64px 112px; }
 #cql-root .ql-list-days .ql-list-row { grid-template-columns: 76px minmax(60px, 1fr) 60px 70px 76px; }
 #cql-root .ql-list-head { padding-bottom: 2px; color: var(--faint); font-size: 12px; }
 #cql-root .ql-list-head span:nth-child(n + 3) { text-align: right; }
 #cql-root .ql-label { min-width: 0; font-weight: 550; }
 #cql-root .ql-label small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 400; }
 #cql-root .ql-val { text-align: right; font-weight: 650; }
-#cql-root .ql-extra { text-align: right; color: var(--muted); }
+#cql-root .ql-extra { text-align: right; white-space: nowrap; color: var(--muted); }
 #cql-root .ql-list-row.is-current .ql-label { color: var(--accent); }
 #cql-root .ql-method { padding-left: 1.1em; color: var(--muted); font-size: 13px; max-width: 46em; }
 #cql-root .ql-method li + li { margin-top: 4px; }
@@ -1348,7 +1358,7 @@ html.dark #cql-root, html.dark #cql-launch {
   #cql-root .ql-row-total span:first-child { display: none; }
   #cql-root .ql-detail { margin: 0 8px 8px 30px; }
   #cql-root .ql-fold { margin: 0 18px; }
-  #cql-root .ql-list-row, #cql-root .ql-list-days .ql-list-row {
+  #cql-root .ql-list-row, #cql-root .ql-list-windows .ql-list-row, #cql-root .ql-list-days .ql-list-row {
     grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "label val extra" "bar bar bar"; gap: 4px 12px;
   }
   #cql-root .ql-list-row > :nth-child(1) { grid-area: label; }
