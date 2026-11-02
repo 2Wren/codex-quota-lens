@@ -5,6 +5,7 @@
 //   node dev/preview.js --mobile --dark  iPhone 深色
 //   node dev/preview.js --no-history     官网历史读取失败，走近似值路径
 //   node dev/preview.js --reset          本周期中途用了额度重置卡（可与其他参数组合）
+//   node dev/preview.js --settled        同一个账号一天后，官网结算越过了重置时刻
 //   node dev/preview.js --month          生成的一个月用量，5 个周期加一次重置，对照真值核对每个周期分到的 credits
 //   node dev/preview.js --readme         重新生成 docs/screenshot*.png
 //
@@ -71,6 +72,23 @@ const usage = () => ({
 const rows = (pairs) => pairs.map(([key, basis_points]) => ({ key, basis_points }));
 
 // 当前周 4115 bp = 41.1%，各维度合计都等于它；ends_at 和 wham 的 reset_at 实测差几百毫秒
+// 10/29 各模型的 credits：前一部分属于上个周期，后一部分属于本周期（和下面 BREAKDOWN 里 10/29 的合计一致）
+const PREV_1029 = { "gpt-6-astra": 620, "gpt-6-sol": 10, "gpt-5.6-luna": 290 };
+const CUR_1029 = { "gpt-6-astra": 1317.55, "gpt-6-sol": 332.6, "gpt-5.6-terra": 322.0, "gpt-5.6-luna": 125.0, "gpt-6-luna": 2.97 };
+// 同一天里 5 小时窗口的用量和 credits 成正比；取这个比例让 13:05 那个窗口正好是 104.5%
+const BP_PER_CREDIT = 10450 / (0.7 * Object.values(CUR_1029).reduce((a, b) => a + b, 0));
+const base5h = (start, credits, share, complete) => {
+  const entries = Object.entries(credits).map(([m, c]) => [m, c * share * BP_PER_CREDIT]);
+  return {
+    window_minutes: 300,
+    starts_at: start,
+    ends_at: new Date(Date.parse(start) + 5 * 3600000).toISOString(),
+    used_basis_points: entries.reduce((a, [, v]) => a + v, 0),
+    accounting_complete: complete,
+    breakdowns: [{ dimension: "model", rows: rows(entries) }],
+  };
+};
+
 const history = () => ({
   data_as_of: "2026-10-31T00:00:00Z",
   periods: [
@@ -130,15 +148,11 @@ const history = () => ({
       accounting_complete: true,
       breakdowns: [],
     },
+    // 10/29 跨两个周期，脚本按这几个窗口的分模型用量拆：上个周期一个窗口，本周期两个（3:7）
+    base5h("2026-10-29T00:48:20Z", PREV_1029, 1, true),
+    base5h("2026-10-29T06:15:02Z", CUR_1029, 0.3, true),
     // 用超 100% 的 5 小时窗口，结束一天多了仍是 accounting_complete: false
-    {
-      window_minutes: 300,
-      starts_at: "2026-10-29T13:05:40Z",
-      ends_at: "2026-10-29T18:05:40Z",
-      used_basis_points: 10450,
-      accounting_complete: false,
-      breakdowns: [],
-    },
+    base5h("2026-10-29T13:05:40Z", CUR_1029, 0.7, false),
   ],
 });
 
@@ -314,12 +328,12 @@ const resetHistory = () => ({
     },
   ],
 });
-// 绝对 credits；10/29–10/31 按真实 totals.credits 和当天 5 小时窗口的模型占比拆
+// 绝对 credits；10/29–10/31 按真实 totals.credits 和当天 5 小时窗口的模型占比拆；11/1 官网结算后看到只有 6.1-sol 和一点 6-luna
 const RESET_BREAKDOWN = [
   day("2026-10-29", { "gpt-6-astra": 428.2, "gpt-6.1-sol": 20.82, "gpt-6.1-sol:fast": 6.7, "gpt-6-sol": 10.94, "gpt-5.6-terra": 22.0, "gpt-5.6-luna": 18.5, "gpt-6-luna": 1.155 }),
   day("2026-10-30", { "gpt-6-sol": 70.9, "gpt-6.1-sol": 43.0, "gpt-5.6-terra": 30.53, "gpt-6-astra": 11.1, "gpt-6.1-sol-wm": 2.59, "gpt-5.6-luna": 2.204 }),
   day("2026-10-31", { "gpt-6.1-sol": 689.14, "gpt-5.6-terra": 22.17, "gpt-5.6-luna": 5.46, "gpt-6-luna": 0.51 }),
-  day("2026-11-01", { "gpt-6.1-sol": 190, "gpt-6-astra": 125, "gpt-5.6-terra": 14, "gpt-5.6-luna": 12.1 }),
+  day("2026-11-01", { "gpt-6.1-sol": 340.7, "gpt-6-luna": 0.4 }),
 ];
 const RESET_TOTALS = [
   counts("2026-10-29", 508.315009, 3261897, 16150144, 279658),
@@ -329,8 +343,56 @@ const RESET_TOTALS = [
 ];
 const RESET = { now: RESET_NOW, usage: resetUsage, history: resetHistory, breakdown: RESET_BREAKDOWN, totals: RESET_TOTALS };
 
+// 同一个 Plus 账号在 2026-11-02 06:06Z 的诊断：官网结算到了 11/2 00:00。
+// 旧周期的 ends_at 改成了重置时刻 05:12:03.281（带毫秒），最终 100.09%；新周期 40 秒后第一次使用才开始，已结算 14.66%。
+// 5 小时窗口也在重置时刻截断。11/1 合计 341.3 credits，按窗口拆应是旧周期约 150、新周期约 191
+const settledUsage = () => {
+  const u = resetUsage();
+  u.rate_limit.primary_window = { used_percent: 0, limit_window_seconds: 18000, reset_after_seconds: 18000, reset_at: 1793617567 };
+  u.rate_limit.secondary_window = { used_percent: 15, limit_window_seconds: 604800, reset_after_seconds: 515197, reset_at: 1794114763 };
+  return u;
+};
+const settledHistory = () => {
+  const h = resetHistory();
+  const old = h.periods.find((p) => p.window_minutes === 10080);
+  Object.assign(old, { ends_at: "2026-11-01T05:12:03.281000Z", used_basis_points: 10008.525453 });
+  old.breakdowns[0].rows.find((r) => r.key === "gpt-6.1-sol").basis_points = 6144.5959684375;
+  return {
+    ...h,
+    data_as_of: "2026-11-02T00:00:00Z",
+    coverage_start: "2026-10-03T00:00:00Z",
+    periods: [
+      p5("2026-11-01T12:36:09.620000Z", "2026-11-01T17:36:09.620000Z", 234.808308, true, [["gpt-6.1-sol", 234.808308]]),
+      p5("2026-11-01T05:12:43.830000Z", "2026-11-01T10:12:43.830000Z", 9150.373544, true, [["gpt-6-luna", 13.923648], ["gpt-6.1-sol", 9136.449896]]),
+      {
+        window_minutes: 10080,
+        plan_type: "plus",
+        starts_at: "2026-11-01T05:12:43.829000Z",
+        ends_at: "2026-11-08T05:12:43.829000Z",
+        accounting_complete: true,
+        used_basis_points: 1466.434664,
+        breakdowns: [
+          { dimension: "model", rows: rows([["gpt-6-luna", 2.17557], ["gpt-6.1-sol", 1464.259094375]]) },
+          { dimension: "thread_source", rows: rows([["ambient_suggestions", 2.00369], ["subagent", 869.749260625], ["user", 594.50983375]]) },
+        ],
+      },
+      p5("2026-11-01T02:32:50.715000Z", "2026-11-01T05:12:03.281000Z", 7395.275076, false, [["gpt-6.1-sol", 7395.275076]]),
+      ...h.periods,
+    ],
+  };
+};
+const SETTLED = {
+  now: Date.parse("2026-11-02T06:06:14.918Z"),
+  usage: settledUsage,
+  history: settledHistory,
+  breakdown: [...RESET_BREAKDOWN.slice(0, 3), day("2026-11-01", { "gpt-6.1-sol": 340.9, "gpt-6-luna": 0.4 })],
+  totals: [...RESET_TOTALS.slice(0, 3), counts("2026-11-01", 341.3, 3405212, 86512640, 198016)],
+};
+
 // 生成一个月的用量，周期、5 小时窗口和官网历史都按真实规则推出来，用来核对脚本算出的每个周期 credits。
-// 每 100% 周额度合 2000 credits；10/27 15:30 用了重置卡；最早那个周期从 9 月底开始，只有一部分在 30 天明细里
+// 每 100% 周额度合 2000 credits；10/27 15:30 用了重置卡；最早那个周期从 9 月底开始，只有一部分在 30 天明细里。
+// 按 2026-11-02 的诊断：重置后要等下一次使用才开始新窗口；结算越过重置时刻后，旧窗口的 ends_at 改成重置时刻；
+// credits 和额度的比例每天不一样（实测相差近 20%），这里每天随机浮动 ±15%
 const MONTH = (() => {
   const now = Date.parse("2026-11-02T04:40:00Z");
   const asOf = Date.parse("2026-11-01T00:00:00Z");
@@ -340,6 +402,8 @@ const MONTH = (() => {
   const H = 3600000;
   const WEEK = 7 * 86400000;
   const FIVE = 5 * H;
+  // 脚本查的 30 天明细从这天开始
+  const firstDay = Date.parse("2026-10-04T00:00:00Z");
   let seed = 20261102;
   const rand = () => {
     seed = (seed + 0x6d2b79f5) | 0;
@@ -351,7 +415,9 @@ const MONTH = (() => {
 
   // 每天两段：UTC 上午一段、下午一段，有的天休息
   const events = [];
+  const factor = new Map();
   for (let day = Date.parse("2026-09-27T00:00:00Z"); day < now; day += 86400000) {
+    factor.set(day, 0.85 + rand() * 0.3);
     if (rand() < 0.15) continue;
     const sessions = [[Math.floor(rand() * 8), 3 + Math.floor(rand() * 3)], [10 + Math.floor(rand() * 7), 2 + Math.floor(rand() * 4)]];
     sessions.forEach(([from, len]) => {
@@ -361,38 +427,41 @@ const MONTH = (() => {
         const total = 8 + rand() * 30;
         const w = MODELS.map(([m, p]) => [m, p * (0.5 + rand())]);
         const wt = w.reduce((a, [, x]) => a + x, 0);
-        events.push({ t, models: Object.fromEntries(w.map(([m, x]) => [m, (total * x) / wt])) });
+        events.push({ t, f: factor.get(day), models: Object.fromEntries(w.map(([m, x]) => [m, (total * x) / wt])) });
       }
     });
   }
   events.sort((a, b) => a.t - b.t);
 
-  // 窗口从第一次使用开始计时；重置卡让每周窗口立刻换新，5 小时窗口清零、等下次使用再开始
+  // 窗口从第一次使用开始计时；重置卡让两种窗口都立刻结束，等下次使用再开始
   const weeks = [];
   const fives = [];
   let week = null;
   let five = null;
   let resetDone = false;
+  // models 是 credits（真值），quota 是折成额度的用量，settled 是其中结算到 data_as_of 的部分
   const open = (list, start) => {
-    const w = { start, cutAt: NaN, models: {}, settledModels: {} };
+    const w = { start, cutAt: NaN, models: {}, quota: {}, settled: {}, recent: {} };
     list.push(w);
     return w;
   };
   const add = (w, e) =>
     Object.entries(e.models).forEach(([m, c]) => {
       w.models[m] = (w.models[m] || 0) + c;
-      if (e.t < asOf) w.settledModels[m] = (w.settledModels[m] || 0) + c;
+      w.quota[m] = (w.quota[m] || 0) + c * e.f;
+      if (e.t < asOf) w.settled[m] = (w.settled[m] || 0) + c * e.f;
+      if (e.t >= firstDay) w.recent[m] = (w.recent[m] || 0) + c;
     });
   events.forEach((e) => {
     if (!resetDone && e.t >= resetAt) {
       resetDone = true;
-      if (week) week.cutAt = resetAt;
+      if (week && week.start + WEEK > resetAt) week.cutAt = resetAt;
       if (five && five.start + FIVE > resetAt) five.cutAt = resetAt;
-      week = open(weeks, resetAt);
+      week = null;
       five = null;
     }
     if (!week || e.t >= week.start + WEEK) week = open(weeks, e.t);
-    if (!five || e.t >= five.start + FIVE || Number.isFinite(five.cutAt)) five = open(fives, e.t);
+    if (!five || e.t >= five.start + FIVE) five = open(fives, e.t);
     add(week, e);
     add(five, e);
   });
@@ -403,12 +472,12 @@ const MONTH = (() => {
     window_minutes: minutes,
     plan_type: "plus",
     starts_at: iso(w.start),
-    ends_at: iso(w.start + minutes * 60000),
+    ends_at: w.cutAt <= asOf ? iso(w.cutAt).replace(".000Z", "Z") : iso(w.start + minutes * 60000),
     accounting_complete: w.start + minutes * 60000 <= asOf,
-    used_basis_points: (total(w.settledModels) / q) * 10000,
+    used_basis_points: (total(w.settled) / q) * 10000,
     breakdowns: [
-      { dimension: "model", rows: rows(Object.entries(w.settledModels).map(([m, c]) => [m, (c / q) * 10000])) },
-      { dimension: "thread_source", rows: rows([["user", (total(w.settledModels) / q) * 10000]]) },
+      { dimension: "model", rows: rows(Object.entries(w.settled).map(([m, c]) => [m, (c / q) * 10000])) },
+      { dimension: "thread_source", rows: rows([["user", (total(w.settled) / q) * 10000]]) },
     ],
   });
   const seen = (w, len) => w.start < asOf && w.start + len > now - 30 * 86400000;
@@ -429,7 +498,7 @@ const MONTH = (() => {
   const live = (w, len, q) => {
     const active = w && now < w.start + len;
     return {
-      used_percent: active ? Math.round((total(w.models) / q) * 100) : 0,
+      used_percent: active ? Math.round((total(w.quota) / q) * 100) : 0,
       limit_window_seconds: len / 1000,
       reset_after_seconds: active ? Math.round((w.start + len - now) / 1000) : len / 1000,
       reset_at: Math.round((active ? w.start + len : now + len) / 1000),
@@ -454,8 +523,8 @@ const MONTH = (() => {
     }),
     breakdown,
     totals,
-    // 每个周期实际用了多少 credits（含还没结算的），对照脚本的拆分结果
-    truth: weeks.map((w) => ({ start: w.start, credits: total(w.models), cut: Number.isFinite(w.cutAt) })),
+    // 每个周期实际用了多少 credits（含还没结算的），对照脚本的拆分结果；明细不全的周期只比 30 天内那部分
+    truth: weeks.map((w) => ({ start: w.start, credits: total(w.models), recent: total(w.recent), cut: Number.isFinite(w.cutAt) })),
   };
 })();
 
@@ -723,11 +792,14 @@ function report(label, { views, requests, problems, saved, diag }, opts) {
     if (leaks.length) process.exitCode = 1;
     const computed = JSON.parse(diag).computed;
     if (computed) {
-      console.log(`换算    每 100% 周额度 ${computed.creditsPer100 ?? "—"} credits`);
+      const unit = computed.unit === "credits" ? "credits" : "（相对值）";
+      console.log(`换算    每 100% 周额度 ${computed.per100 ?? "—"} ${unit}`);
       computed.cycles.forEach((c) => {
-        const truth = opts.scenario?.truth?.find((t) => Math.abs(t.start - Date.parse(c.start)) < 60000);
-        const versus = truth ? `（实际 ${Math.round(truth.credits)}，差 ${(((c.credits - truth.credits) / truth.credits) * 100).toFixed(1)}%）` : "";
-        console.log(`  ${c.start.slice(5, 16)} – ${c.end.slice(5, 16)}  ${c.settled ?? "—"}%${c.cut ? " 提前重置" : ""}${c.partial ? " 明细不全" : ""}  ${c.credits} credits${versus}`);
+        const truth = computed.unit === "credits" && opts.scenario?.truth?.find((t) => Math.abs(t.start - Date.parse(c.start)) < 60000);
+        const real = truth && (c.partial ? truth.recent : truth.credits);
+        const diff = real > 0 ? `差 ${(((c.amount - real) / real) * 100).toFixed(1)}%` : `差 ${(c.amount - real).toFixed(1)}`;
+        const versus = truth ? `（实际${c.partial ? "（30 天内）" : ""} ${Math.round(real)}，${diff}）` : "";
+        console.log(`  ${c.start.slice(5, 16)} – ${c.end.slice(5, 16)}  ${c.settled ?? "—"}%${c.cut ? " 提前重置" : ""}${c.partial ? " 明细不全" : ""}  ${c.amount} ${unit}${versus}`);
         const shared = c.days.filter((d) => d.includes(" "));
         if (shared.length) console.log(`      跨周期：${shared.join("，")}`);
       });
@@ -760,8 +832,8 @@ function report(label, { views, requests, problems, saved, diag }, opts) {
     }
     return;
   }
-  const name = args.has("--reset") ? "reset" : args.has("--month") ? "month" : "";
-  const scenario = { reset: RESET, month: MONTH }[name] || BASE;
+  const name = ["reset", "settled", "month"].find((k) => args.has(`--${k}`)) || "";
+  const scenario = { reset: RESET, settled: SETTLED, month: MONTH }[name] || BASE;
   const opts = { mobile: args.has("--mobile"), dark: args.has("--dark"), noHistory: args.has("--no-history"), scenario };
   const tag = [opts.mobile ? "mobile" : "desktop", opts.dark ? "dark" : "light", name, opts.noHistory ? "nohistory" : ""]
     .filter(Boolean)

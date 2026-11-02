@@ -52,6 +52,8 @@
     ambient_suggestions: "环境建议",
     thread_title: "生成会话标题",
     subagent: "子代理",
+    automation: "自动化",
+    system: "系统",
     unknown: "未分类",
   };
 
@@ -512,12 +514,15 @@
       ? same.find((p) => Math.abs(p.end - reset) <= tolerance) || null
       : same.find((p) => p.start <= now && now < p.end) || null;
 
-    // 提前结束的窗口：在它结束之前，已经有同样长度的新窗口开始了（新周期可能还没进历史，所以也拿 wham 的周期比）
+    // 提前结束的窗口有两种样子：结算到重置时刻之后，ends_at 会改成实际结束的时刻（整秒），比窗口长度短；
+    // 还没结算到那时，ends_at 仍是原定时间，只能看到在它结束之前已经有同样长度的新窗口开始了
+    // （新周期可能还没进历史，所以也拿 wham 的周期比）
     periods.forEach((p) => {
       const starts = periods.filter((q) => q !== p && q.minutes === p.minutes).map((q) => q.start);
       if (p.minutes === minutes && range.known) starts.push(range.start);
-      p.cutAt = Math.min(...starts.filter((s) => s > p.start + tolerance && s < p.end - tolerance));
-      if (!Number.isFinite(p.cutAt)) p.cutAt = NaN;
+      const next = Math.min(...starts.filter((s) => s > p.start + tolerance && s < p.end - tolerance));
+      const short = p.minutes > 0 && p.end - p.start < p.minutes * 60000 - tolerance;
+      p.cutAt = Number.isFinite(next) ? next : short ? p.end : NaN;
     });
 
     return { asOf: Date.parse(payload.data_as_of), periods, current, tolerance };
@@ -565,28 +570,66 @@
     return cycles.sort((a, b) => b.start - a.start);
   };
 
-  // 5 小时窗口从第一次使用才开始计时，用量只会落在这些窗口里，所以拿窗口覆盖的时长估计一段时间里有没有在用
-  const activeTime = (history, lo, hi) =>
-    sum((history?.periods || []).filter((p) => p.minutes > 0 && p.minutes < 1440), (p) =>
-      Math.max(0, Math.min(Number.isFinite(p.cutAt) ? p.cutAt : p.end, hi) - Math.max(p.start, lo)),
-    );
-
-  // 一天里几个周期各占多少：有 5 小时窗口记录就按窗口覆盖的时长，没有就按时长。
-  // 第一个周期开始之前如果也有窗口，那段属于历史里没有的更早周期，记作 lost
-  const timeShares = (owners, ts, history, now) => {
-    const hi = Math.min(ts + DAY_MS, now);
-    const spans = owners.map((c) => [Math.max(c.start, ts), Math.min(c.until, hi)]);
-    const lead = Math.min(...spans.map(([s]) => s));
-    const lost = lead > ts ? activeTime(history, ts, lead) : 0;
-    const active = spans.map(([s, e]) => (e > s ? activeTime(history, s, e) : 0));
-    const total = sum(active, (v) => v) + lost;
-    if (total > 0) return { shares: active.map((v) => v / total), lost: lost / total };
-    const plain = spans.map(([s, e]) => Math.max(0, e - s));
-    const all = sum(plain, (v) => v);
-    return { shares: plain.map((v) => (all > 0 ? v / all : 1 / owners.length)), lost: 0 };
+  // 5 小时窗口从第一次使用才开始计时，用量只会落在这些窗口里；重置会让它和每周窗口在同一时刻结束。
+  // 官网给了每个窗口用了多少、各模型各多少，按窗口落在一段时间里的时长比例摊进去，就能估出这段时间的用量。
+  // 窗口的用量只结算到 data_as_of，所以窗口按那一刻截止
+  const usageIn = (history, lo, hi) => {
+    const out = { all: 0, models: new Map() };
+    const asOf = Number.isFinite(history?.asOf) ? history.asOf : Infinity;
+    (history?.periods || [])
+      .filter((p) => p.minutes > 0 && p.minutes < 1440)
+      .forEach((p) => {
+        const end = Math.min(Number.isFinite(p.cutAt) ? p.cutAt : p.end, asOf);
+        const overlap = Math.min(end, hi) - Math.max(p.start, lo);
+        if (end <= p.start || overlap <= 0) return;
+        const f = overlap / (end - p.start);
+        out.all += p.used * f;
+        asArray(p.breakdowns?.model).forEach((r) => {
+          const k = modelName(r.key);
+          out.models.set(k, (out.models.get(k) || 0) + r.ratio * f);
+        });
+      });
+    return out;
   };
 
-  // 每 100% 周额度合多少 credits：从明细能覆盖到的最早一个周期起，已结算整天的 credits ÷ 这些周期已结算用量之和。
+  // 一天里几个周期各占多少。已结算的日子按 5 小时窗口的用量分，能细到每个模型（by: "5h"）；
+  // 没结算或没有窗口记录就按时长分（by: "time"）。
+  // 第一个已知周期开始之前如果也有用量，那段属于历史里没有的更早周期，记作 lost
+  const dayShares = (owners, ts, history, now, settled) => {
+    const hi = Math.min(ts + DAY_MS, now);
+    const spans = owners.map((c) => [Math.max(c.start, ts), Math.min(c.until, hi)]);
+    if (settled) {
+      // 周期自然结束后，5 小时窗口还会继续走，但下个周期开始之前不会有用量，所以这段空档算前一个周期的
+      const lead = spans[0][0];
+      const parts = spans.map(([s], k) => usageIn(history, s, k + 1 < spans.length ? spans[k + 1][0] : hi));
+      const head = usageIn(history, ts, lead);
+      const total = sum(parts, (u) => u.all) + head.all;
+      if (total > EPS) {
+        const model = (m) => {
+          const v = parts.map((u) => u.models.get(m) || 0);
+          const l = head.models.get(m) || 0;
+          const t = sum(v, (x) => x) + l;
+          return t > EPS ? { shares: v.map((x) => x / t), lost: l / t } : null;
+        };
+        return { by: "5h", shares: parts.map((u) => u.all / total), lost: head.all / total, model };
+      }
+    }
+    const plain = spans.map(([s, e]) => Math.max(0, e - s));
+    const all = sum(plain, (v) => v);
+    return { by: "time", shares: plain.map((v) => (all > 0 ? v / all : 1 / owners.length)), lost: 0, model: () => null };
+  };
+
+  // 拆分和换算都用每日明细里的相对 credits：同一次查询里它和绝对 credits 成正比，
+  // 而且 Team 账号的 counts 接口 credits 全是 0，只有相对值可用
+  const unitsOf = (d) => sum(d.models, (m) => m.credits);
+
+  // 绝对 credits ÷ 相对值，用来把结果换回 credits；个人账号才有
+  const creditScale = (days) => {
+    const both = days.filter((d) => d.absCredits > EPS && unitsOf(d) > EPS);
+    return both.length ? sum(both, (d) => d.absCredits) / sum(both, unitsOf) : NaN;
+  };
+
+  // 每 100% 周额度合多少（相对值）：从明细能覆盖到的最早一个周期起，已结算整天的用量 ÷ 这些周期已结算用量之和。
   // 最早那天如果还混着更早周期的用量，按时长比例扣掉
   const estimateQuota = (cycles, days, history, firstTs, now) => {
     const asOf = history?.asOf;
@@ -595,37 +638,16 @@
     if (!set.length || set.some((c) => !Number.isFinite(c.settled))) return NaN;
     const from = dayOf(Math.min(...set.map((c) => c.start)));
     const settledDays = days.filter((d) => d.ts >= from && d.ts + DAY_MS <= asOf);
-    if (settledDays.some((d) => d.weight > EPS && !(d.absCredits > EPS))) return NaN;
-    let credits = sum(settledDays, (d) => d.absCredits);
+    if (settledDays.some((d) => d.total > EPS && !(unitsOf(d) > EPS))) return NaN;
+    let units = sum(settledDays, unitsOf);
     const head = settledDays.find((d) => d.ts === from);
     if (head) {
       const owners = cycles.filter((c) => c.start < from + DAY_MS && c.until > from).sort((x, y) => x.start - y.start);
-      const { shares, lost } = timeShares(owners, from, history, now);
-      credits -= head.absCredits * (lost + sum(owners, (c) => (set.includes(c) ? 0 : shares[owners.indexOf(c)])));
+      const { shares, lost } = dayShares(owners, from, history, now, true);
+      units -= unitsOf(head) * (lost + sum(owners, (c) => (set.includes(c) ? 0 : shares[owners.indexOf(c)])));
     }
     const used = sum(set, (c) => c.settled);
-    return used > 0.005 && credits > EPS ? credits / used : NaN;
-  };
-
-  // 后一个周期在这天分到 share 个 credits，再按官网各模型还没分完的额度细分到模型；单个模型不超过它当天的用量
-  const modelFractions = (cycle, abs, share, quota, perModel) => {
-    const total = sum([...abs.values()], (v) => v);
-    const uniform = total > EPS ? share / total : 0;
-    const out = new Map([...abs.keys()].map((k) => [k, uniform]));
-    const rows = perModel ? asArray(cycle.breakdowns?.model) : [];
-    if (!rows.length) return out;
-    const official = new Map(rows.map((r) => [modelName(r.key), r.ratio]));
-    const target = new Map();
-    abs.forEach((v, k) => target.set(k, clampTo((official.get(k) || 0) * quota - (cycle.laterModel.get(k) || 0), 0, v)));
-    const picked = sum([...target.values()], (v) => v);
-    if (picked <= EPS) return out;
-    abs.forEach((v, k) => target.set(k, Math.min(v, (target.get(k) * share) / picked)));
-    const rest = share - sum([...target.values()], (v) => v);
-    const room = [...abs.entries()].map(([k, v]) => [k, v - target.get(k)]).filter(([, r]) => r > EPS);
-    const roomTotal = sum(room, ([, r]) => r);
-    if (rest > EPS && roomTotal > EPS) room.forEach(([k, r]) => target.set(k, target.get(k) + Math.min(r, (rest * r) / roomTotal)));
-    abs.forEach((v, k) => out.set(k, v > EPS ? target.get(k) / v : uniform));
-    return out;
+    return used > 0.005 && units > EPS ? units / used : NaN;
   };
 
   // 把一天按比例拆成几份；最后一份拿余数，各份加起来正好等于原来那天
@@ -657,69 +679,50 @@
     });
   };
 
-  // 每日数据按 UTC 日分桶，一天可能跨两个周期（提前重置当天，或上个周期结束、本周期开始在同一天）。
-  // 从最近的一天往回分，这样分到某个跨周期的日子时，后一个周期其余几天都已经分完：
-  // 那天已结算，后一个周期就拿「官方用量 × 换算比例 − 它其余几天」，能细到每个模型；
-  // 还没结算、后一个是当前周期，就拿「实时用量 × 换算比例 − 它其余几天」；都不行就按时长比例
+  // 每日数据按 UTC 日分桶，一天可能跨两个周期（提前重置当天，或上个周期结束、本周期开始在同一天）。拆法：
+  // 已结算的日子按 5 小时窗口的官方用量拆，细到每个模型；
+  // 还没结算、后一个是当前周期，就让它拿「实时用量 × 换算比例 − 它之后几天」，所以从最近的一天往回分；
+  // 都不行就按时长。credits 和额度的比例每天都在变（Plus 实测 11/1 比前几天低 17%），能不用换算比例就不用
   const assignDays = (cycles, days, history, quota, now) => {
     const asOf = history?.asOf;
     const order = [...cycles].sort((a, b) => a.start - b.start);
     order.forEach((c) => {
       c.days = [];
       c.later = 0;
-      c.laterSettled = 0;
-      c.laterModel = new Map();
     });
-    const isSettled = (d) => Number.isFinite(asOf) && d.ts + DAY_MS <= asOf;
-    const absOf = (d, scale) => {
-      const abs = new Map();
-      if (Number.isFinite(scale)) d.models.forEach((m) => abs.set(m.model, (abs.get(m.model) || 0) + m.credits * scale));
-      return abs;
-    };
-    const credit = (c, d, abs) =>
-      abs.forEach((v, k) => {
-        c.later += v;
-        if (!isSettled(d)) return;
-        c.laterSettled += v;
-        c.laterModel.set(k, (c.laterModel.get(k) || 0) + v);
-      });
-
     days
       .filter((d) => Number.isFinite(d.ts))
       .sort((a, b) => b.ts - a.ts)
       .forEach((d) => {
         const owners = order.filter((c) => c.start < d.ts + DAY_MS && c.until > d.ts);
         if (!owners.length) return;
-        const relTotal = sum(d.models, (m) => m.credits);
-        const scale = d.absCredits > EPS && relTotal > EPS ? d.absCredits / relTotal : NaN;
-        const time = timeShares(owners, d.ts, history, now);
-        if (owners.length === 1 && time.lost < 0.005) {
-          owners[0].days.push(d);
-          credit(owners[0], d, absOf(d, scale));
+        const settled = Number.isFinite(asOf) && d.ts + DAY_MS <= asOf;
+        const shares = dayShares(owners, d.ts, history, now, settled);
+        const keep = (piece, k) => {
+          if (piece.shared && !(unitsOf(piece) > EPS) && !(piece.total > 0)) return;
+          owners[k].days.push(piece);
+          owners[k].later += unitsOf(piece);
+        };
+        if (owners.length === 1 && shares.lost < 0.005) {
+          keep(d, 0);
           return;
         }
-        let method = "time";
-        let fractions = null;
-        if (owners.length === 2 && Number.isFinite(quota) && Number.isFinite(scale)) {
-          const b = owners[1];
-          let shareB = NaN;
-          if (isSettled(d) && Number.isFinite(b.settled)) shareB = clampTo(b.settled * quota - b.laterSettled, 0, d.absCredits);
-          else if (b.current) shareB = clampTo(b.live * quota - b.later, 0, d.absCredits);
-          if (Number.isFinite(shareB)) {
-            method = "credits";
-            const fb = modelFractions(b, absOf(d, scale), shareB, quota, isSettled(d));
-            fractions = [(model) => 1 - (fb.get(model) ?? 0), (model) => fb.get(model) ?? 0];
-          }
+        const b = owners[owners.length - 1];
+        const total = unitsOf(d);
+        let method = shares.by;
+        let fractions;
+        if (!settled && owners.length === 2 && b.current && Number.isFinite(quota) && total > EPS) {
+          const s = clampTo(b.live * quota - b.later, 0, total) / total;
+          method = "credits";
+          fractions = [() => 1 - s, () => s];
+        } else {
+          const of = (model) => shares.model(model) || shares;
+          fractions = owners.map((c, k) => (model) => of(model).shares[k]);
+          // 多出来的那份属于历史里没有的更早周期，拆出来丢掉
+          if (shares.lost > 0) fractions.push((model) => of(model).lost);
         }
-        if (!fractions) {
-          fractions = time.shares.map((v) => () => v);
-          if (time.lost > 0) fractions.push(() => time.lost);
-        }
-        // 多出来的那份属于历史里没有的更早周期，丢掉
         splitDay(d, fractions, method).forEach((piece, k) => {
-          if (k >= owners.length) return;
-          owners[k].days.push(piece);
-          credit(owners[k], d, absOf(piece, scale));
+          if (k < owners.length) keep(piece, k);
         });
       });
     order.forEach((c) => c.days.sort((x, y) => x.ts - y.ts));
@@ -760,8 +763,8 @@
     const settled = c.settled;
     const hasSettled = Number.isFinite(settled);
     // 过去的周期没有实时值；结束时间晚于结算截止的，用每日明细里还没结算的 credits 估出剩下那段
-    const unsettledCredits = !c.current && Number.isFinite(asOf) ? sum(days.filter((d) => d.ts + DAY_MS > asOf), (d) => d.absCredits) : 0;
-    const estimated = !c.current && hasSettled && quota > EPS ? unsettledCredits / quota : 0;
+    const unsettledUnits = !c.current && Number.isFinite(asOf) ? sum(days.filter((d) => d.ts + DAY_MS > asOf), unitsOf) : 0;
+    const estimated = !c.current && hasSettled && quota > EPS ? unsettledUnits / quota : 0;
     const live = c.current ? usedRatio(weekly) : Math.max(0, n(settled)) + estimated;
     const livePercent = c.current ? firstPositive(weekly?.used_percent, weekly?.usedPercent) || live * 100 : live * 100;
     const pending = c.current ? (hasSettled ? Math.max(0, live - settled) : 0) : estimated;
@@ -1047,13 +1050,14 @@
 
   const renderFigures = (v) => {
     const star = v.unknownModels.length ? "*" : "";
+    const none = v.partial && !(v.tokens > 0);
     return `
       <section class="ql-figures">
-        <div class="ql-figure"><b>${fmtUsd(v.usd)}${star}</b><span>折合 API 价格</span></div>
+        <div class="ql-figure"><b>${none ? "—" : `${fmtUsd(v.usd)}${star}`}</b><span>折合 API 价格</span></div>
         <div class="ql-figure"><b>${Number.isFinite(v.projectedUsd) ? `${fmtUsd(v.projectedUsd)}${star}` : "—"}</b><span>${
-          Number.isFinite(v.projectedUsd) ? (v.current ? "整周推算" : "整周额度约合") : v.partial ? "明细不全，暂无推算" : "数据不足，暂无推算"
+          Number.isFinite(v.projectedUsd) ? (v.current ? "整周推算" : "整周额度约合") : "暂无推算"
         }</span></div>
-        <div class="ql-figure"><b>${fmtTokens(v.tokens)}</b><span>已统计 Tokens</span></div>
+        <div class="ql-figure"><b>${none ? "—" : fmtTokens(v.tokens)}</b><span>已统计 Tokens</span></div>
       </section>`;
   };
 
@@ -1068,7 +1072,13 @@
     if (v.timeSplitDays.length) {
       notes.push(`${v.timeSplitDays.map((d) => esc(fmtDay(d.key))).join("、")} 跨了两个周期，只能按使用时长粗略拆分，这几天的 Token 和金额是估算。`);
     }
-    if (v.partial) notes.push("这个周期开头有几天超出了能查到的 30 天明细，Token 和金额不全。");
+    if (v.partial) {
+      notes.push(
+        v.tokens > 0
+          ? "这个周期开头有几天超出了能查到的 30 天明细，Token 和金额不全。"
+          : "这个周期的用量都在能查到的 30 天明细之前，只有官网的额度数据，没有 Token 和金额。",
+      );
+    }
     if (v.missingDays) notes.push(`有 ${v.missingDays} 天只有额度数据、没有 Token 明细，这几天不计入金额。`);
     if (v.unknownModels.length) notes.push(`${v.unknownModels.map(esc).join("、")} 没有公开 API 价格，带 * 的金额只算了其余模型。`);
     return notes.map((t) => `<p class="ql-notice">${t}</p>`).join("");
@@ -1114,7 +1124,7 @@
           <span class="ql-dot" style="background:${m.color}"></span>
           <span class="ql-name">${esc(m.model)}${speedLabel(m.speed) ? `<span class="ql-tag">${esc(speedLabel(m.speed))}</span>` : ""}</span>
           <span class="ql-cell c-quota">${m.unsettled ? `<span title="这部分用量还没进官网结算">—</span>` : `${approx(m)}${fmtPct(m.quota)}`}</span>
-          <span class="ql-cell c-tok">${m.total > EPS ? fmtTokensAs(m.total, unit) : "—"}</span>
+          <span class="ql-cell c-tok${m.total > EPS ? "" : " is-none"}">${m.total > EPS ? fmtTokensAs(m.total, unit) : "—"}</span>
           <span class="ql-cell c-usd">${m.total > EPS && !m.unknownPricing ? fmtUsd(m.usd) : "—"}</span>
         </button>
         <div class="ql-detail" data-detail="${i}" hidden>${modelDetail(m)}</div>`,
@@ -1124,7 +1134,7 @@
       <section class="ql-block">
         <div class="ql-block-head">
           <h3>模型</h3>
-          <p class="ql-hint">${v.quotaApprox ? "占周额度按实时比例近似" : "占周额度为官网数据"}，Token 与金额为估算，点一行看计算</p>
+          <p class="ql-hint">${v.quotaApprox ? "占周额度按实时比例近似" : "占周额度为官网数据"}${v.tokens > 0 ? "，Token 与金额为估算，点一行看计算" : ""}</p>
         </div>
         <div class="ql-cols"><span></span><span>模型</span><span>占周额度</span><span>Tokens</span><span>折合金额</span></div>
         <div class="ql-rows">${rows}</div>
@@ -1132,8 +1142,8 @@
           <span></span>
           <span class="ql-name">合计</span>
           <span class="ql-cell c-quota">${v.quotaApprox ? "≈" : ""}${fmtPct(v.quotaTotal)}</span>
-          <span class="ql-cell c-tok">${fmtTokensAs(v.tokens, unit)}</span>
-          <span class="ql-cell c-usd">${fmtUsd(v.usd)}</span>
+          <span class="ql-cell c-tok${v.tokens > 0 ? "" : " is-none"}">${v.tokens > 0 ? fmtTokensAs(v.tokens, unit) : "—"}</span>
+          <span class="ql-cell c-usd">${v.tokens > 0 ? fmtUsd(v.usd) : "—"}</span>
         </div>
       </section>`;
   };
@@ -1244,7 +1254,7 @@
         <li>Token 来自每日统计。个人账号每天只有合计，多个模型时按各模型费率反推分配，所以是估算。</li>
         <li>金额按 OpenAI API 公开价格折算，Fast 按 2.5 倍、Ultrafast 按 8 倍，只是等价参考，不是账单。</li>
         <li>整周推算等于已结算时段的金额除以同一时段的已用比例，也就是用满一周额度大约值多少。</li>
-        <li>每日统计按 UTC 日期分，一天可能跨两个周期（比如提前重置那天）。这时按各周期的官方用量把当天的 credits 拆开，Token 和金额跟着拆；还没结算的，先用实时用量估；都没有时，按 5 小时窗口看两边各用了多久。</li>
+        <li>每日统计按 UTC 日期分，一天可能跨两个周期（比如提前重置那天）。这时按官网 5 小时窗口的用量把当天拆开（重置会让 5 小时窗口同时结束，所以分得准），Token 和金额跟着拆；还没结算的先用实时用量估，再不行就按时长估。</li>
       </ul>`,
       folds,
     );
@@ -1350,7 +1360,9 @@
       "/backend-api/wham/usage",
       `/backend-api/wham/usage/plan_limit_history?days=${RANGE_DAYS}`,
       "/backend-api/wham/rate-limit-reset-credits",
-      ...paths.filter((p) => /daily-token-usage-breakdown|daily-workspace-usage-counts/.test(p)).slice(0, 2),
+      ...[/daily-token-usage-breakdown/, /daily-workspace-usage-counts/, /daily-workspace-user-token-usage-breakdown/]
+        .map((re) => paths.find((p) => re.test(p)))
+        .filter(Boolean),
     ];
     const queue = [...new Set(probes)];
     const samples = [];
@@ -1362,9 +1374,14 @@
         // 历史里窗口很多，抽样会漏掉每周窗口，单独列出来
         if (path.includes("plan_limit_history")) {
           sample.periodCount = asArray(body?.periods).length;
-          sample.weekly = asArray(body?.periods)
-            .filter((p) => n(p?.window_minutes) === 10080)
-            .map((p) => [p.starts_at, p.ends_at, n(p.used_basis_points), Boolean(p.accounting_complete)]);
+          const bp = (v) => Math.round(n(v) * 10) / 10;
+          const models = (p) =>
+            Object.fromEntries(
+              asArray(asArray(p?.breakdowns).find((b) => b?.dimension === "model")?.rows).map((r) => [modelName(r?.key), bp(r?.basis_points)]),
+            );
+          const of = (minutes) => asArray(body?.periods).filter((p) => n(p?.window_minutes) === minutes);
+          sample.weekly = of(10080).map((p) => [p.starts_at, p.ends_at, bp(p.used_basis_points), Boolean(p.accounting_complete), models(p)]);
+          sample.short = of(300).map((p) => [p.starts_at, p.ends_at, bp(p.used_basis_points), models(p)]);
         }
         samples.push(sample);
       } catch (error) {
@@ -1373,20 +1390,38 @@
       }
     }
     const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+    const round = (v, k = 1) => (Number.isFinite(v) ? Math.round(v * k) / k : null);
+    // 有绝对 credits 时换算成 credits，没有时（Team）就是每日明细里的相对值
     const computed = state
-      ? {
-          creditsPer100: Number.isFinite(state.data.quota) ? Math.round(state.data.quota) : null,
-          cycles: state.data.cycles.map((c) => ({
-            start: iso(c.start),
-            end: iso(c.end),
-            settled: Number.isFinite(c.settled) ? Math.round(c.settled * 10000) / 100 : null,
-            current: c.current,
-            cut: c.cut,
-            partial: Boolean(c.partial),
-            credits: Math.round(sum(c.days, (d) => d.absCredits)),
-            days: c.days.map((d) => `${d.key}${d.shared ? ` ${d.splitBy} ${Math.round(d.absCredits)}` : ""}`),
-          })),
-        }
+      ? (() => {
+          const { quota, cycles, days, mode } = state.data;
+          const scale = creditScale(days);
+          const amount = (u) => (Number.isFinite(scale) ? round(u * scale) : round(u, 100));
+          return {
+            mode,
+            unit: Number.isFinite(scale) ? "credits" : "relative",
+            per100: amount(quota),
+            cycles: cycles.map((c) => ({
+              start: iso(c.start),
+              end: iso(c.end),
+              settled: round(c.settled * 100, 100),
+              current: c.current,
+              cut: c.cut,
+              partial: Boolean(c.partial),
+              amount: amount(sum(c.days, unitsOf)),
+              days: c.days.map((d) => `${d.key}${d.shared ? ` ${d.splitBy} ${amount(unitsOf(d))}` : ""}`),
+            })),
+            // 日期、相对值、绝对 credits、Token 合计、各模型相对值
+            days: days.map((d) => {
+              const models = {};
+              d.models.forEach((m) => {
+                const k = m.speed === "standard" ? m.model : `${m.model}:${m.speed}`;
+                if (m.credits > EPS) models[k] = round(m.credits, 100);
+              });
+              return [d.key, round(unitsOf(d), 100), round(d.absCredits, 10), d.total, models];
+            }),
+          };
+        })()
       : null;
     const report = JSON.stringify(
       {
@@ -1707,6 +1742,7 @@ html.dark #cql-root, html.dark #cql-launch {
   #cql-root .c-quota { grid-area: quota; }
   #cql-root .c-tok { grid-area: tok; text-align: left; font-size: 12.5px; }
   #cql-root .c-tok::after { content: " tokens"; }
+  #cql-root .c-tok.is-none::after { content: none; }
   #cql-root .c-usd { grid-area: usd; font-size: 12.5px; }
   #cql-root .ql-row-total span:first-child { display: none; }
   #cql-root .ql-detail { margin: 0 8px 8px 30px; }
