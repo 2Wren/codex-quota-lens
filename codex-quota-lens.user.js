@@ -341,28 +341,40 @@
     };
   };
 
-  const buildTeamDays = (list) =>
-    list
-      .map((row) => {
-        const key = String(row?.date || "").slice(0, 10);
+  // Team 接口有每个模型、每种速度的 Token，但 credits 全是 0（2026-11-02 实测），
+  // 用量单位从每日明细接口补，那里的 credits 是相对值，和个人账号一样
+  const buildTeamDays = (list, breakdownList) => {
+    const byKey = (rows) => new Map(rows.map((r) => [String(r?.date || "").slice(0, 10), r]).filter(([key]) => key));
+    const teamMap = byKey(list);
+    const breakdownMap = byKey(breakdownList);
+    const keys = [...new Set([...teamMap.keys(), ...breakdownMap.keys()])].sort();
+    return keys
+      .map((key) => {
+        const row = teamMap.get(key);
+        const breakdownRow = breakdownMap.get(key);
+        const credits = new Map();
+        asArray(breakdownRow?.models).forEach((m) => {
+          const k = `${itemModel(m)}|${speedName(m.speed)}`;
+          credits.set(k, (credits.get(k) || 0) + Math.max(0, n(m.credits)));
+        });
         const models = asArray(row?.models).map((m) => {
           const p = tokenParts(m);
-          return {
-            model: itemModel(m),
-            speed: speedName(m.speed),
-            input: p.input,
-            cached: p.cached,
-            output: p.output,
-            total: tokenTotal(m),
-            credits: Math.max(0, n(m.credits)),
-            estimated: false,
-            fallback: false,
-          };
+          const k = `${itemModel(m)}|${speedName(m.speed)}`;
+          const c = credits.has(k) ? credits.get(k) : Math.max(0, n(m.credits));
+          credits.delete(k);
+          return { model: itemModel(m), speed: speedName(m.speed), input: p.input, cached: p.cached, output: p.output, total: tokenTotal(m), credits: c, estimated: false, fallback: false };
         });
+        credits.forEach((c, k) => {
+          const [model, speed] = k.split("|");
+          if (c > EPS) models.push({ model, speed, input: 0, cached: 0, output: 0, total: 0, credits: c, estimated: false, fallback: false });
+        });
+        const total = sum(models, (m) => m.total);
+        if (total <= EPS && !(sum(models, (m) => m.credits) > EPS)) return null;
         const parts = { input: sum(models, (m) => m.input), cached: sum(models, (m) => m.cached), output: sum(models, (m) => m.output) };
-        return makeDay(key, dayWeight(row), parts, sum(models, (m) => m.total), models);
+        return makeDay(key, firstPositive(dayWeight(breakdownRow), dayWeight(row)), parts, total, models, { missingTokens: total <= EPS });
       })
-      .filter((d) => d.key && d.total > EPS);
+      .filter(Boolean);
+  };
 
   const splitInteger = (total, shares) => {
     const t = Math.max(0, Math.round(n(total)));
@@ -449,19 +461,26 @@
 
   async function loadDaily(params) {
     const query = params.toString();
+    // 两种账号都要用到这个每日明细，先发出去
+    const breakdown = api(`/backend-api/wham/usage/daily-token-usage-breakdown?${query}`);
+    breakdown.catch(() => {});
+    let team = null;
     try {
-      const payload = await api(`/backend-api/wham/usage/daily-workspace-user-token-usage-breakdown?${query}`);
-      return { mode: "team", days: buildTeamDays(extractList(payload)) };
+      team = await api(`/backend-api/wham/usage/daily-workspace-user-token-usage-breakdown?${query}`);
     } catch (error) {
       if (!(error.status === 400 && /no active workspace/i.test(error.detail || error.message))) throw error;
     }
+    if (team) {
+      const rows = await breakdown.then(extractList, (error) => {
+        console.warn("[Codex 额度透镜] 读取每日明细失败，跨周期的日子只能按时长拆", error);
+        return [];
+      });
+      return { mode: "team", days: buildTeamDays(extractList(team), rows) };
+    }
     const totalsParams = new URLSearchParams(params);
     totalsParams.set("workspace_user", "true");
-    const [breakdown, totals] = await Promise.all([
-      api(`/backend-api/wham/usage/daily-token-usage-breakdown?${query}`),
-      api(`/backend-api/wham/analytics/daily-workspace-usage-counts?${totalsParams}`),
-    ]);
-    return { mode: "personal", days: buildPersonalDays(extractList(totals), extractList(breakdown)) };
+    const [rows, totals] = await Promise.all([breakdown, api(`/backend-api/wham/analytics/daily-workspace-usage-counts?${totalsParams}`)]);
+    return { mode: "personal", days: buildPersonalDays(extractList(totals), extractList(rows)) };
   }
 
 
@@ -573,11 +592,11 @@
   // 5 小时窗口从第一次使用才开始计时，用量只会落在这些窗口里；重置会让它和每周窗口在同一时刻结束。
   // 官网给了每个窗口用了多少、各模型各多少，按窗口落在一段时间里的时长比例摊进去，就能估出这段时间的用量。
   // 窗口的用量只结算到 data_as_of，所以窗口按那一刻截止
-  const usageIn = (history, lo, hi) => {
+  const usageIn = (history, lo, hi, keep = () => true) => {
     const out = { all: 0, models: new Map() };
     const asOf = Number.isFinite(history?.asOf) ? history.asOf : Infinity;
     (history?.periods || [])
-      .filter((p) => p.minutes > 0 && p.minutes < 1440)
+      .filter((p) => p.minutes > 0 && p.minutes < 1440 && keep(p))
       .forEach((p) => {
         const end = Math.min(Number.isFinite(p.cutAt) ? p.cutAt : p.end, asOf);
         const overlap = Math.min(end, hi) - Math.max(p.start, lo);
@@ -594,24 +613,30 @@
 
   // 一天里几个周期各占多少。已结算的日子按 5 小时窗口的用量分，能细到每个模型（by: "5h"）；
   // 没结算或没有窗口记录就按时长分（by: "time"）。
-  // 第一个已知周期开始之前如果也有用量，那段属于历史里没有的更早周期，记作 lost
+  // 不属于任何已知周期的用量记作 lost：第一个已知周期开始之前的（更早的周期），
+  // 和最后一个周期结束之后才开始的窗口（历史里缺了的周期，Team 账号实测缺过 10/15–10/20 一整周）
   const dayShares = (owners, ts, history, now, settled) => {
     const hi = Math.min(ts + DAY_MS, now);
     const spans = owners.map((c) => [Math.max(c.start, ts), Math.min(c.until, hi)]);
     if (settled) {
-      // 周期自然结束后，5 小时窗口还会继续走，但下个周期开始之前不会有用量，所以这段空档算前一个周期的
+      // 周期自然结束后，5 小时窗口还会继续走，但下个周期开始之前不会有用量，所以这段空档算前一个周期的。
+      // 在周期结束那一刻或之后才开始的窗口不可能有它的用量（Team 实测有窗口正好从重置那一刻开始）
       const lead = spans[0][0];
-      const parts = spans.map(([s], k) => usageIn(history, s, k + 1 < spans.length ? spans[k + 1][0] : hi));
+      const end = owners[owners.length - 1].until;
+      const parts = spans.map(([s], k) =>
+        usageIn(history, s, k + 1 < spans.length ? spans[k + 1][0] : hi, (p) => p.start < owners[k].until),
+      );
       const head = usageIn(history, ts, lead);
-      const total = sum(parts, (u) => u.all) + head.all;
+      const tail = usageIn(history, end, hi, (p) => p.start >= end);
+      const lost = (m) => (m ? (head.models.get(m) || 0) + (tail.models.get(m) || 0) : head.all + tail.all);
+      const total = sum(parts, (u) => u.all) + lost();
       if (total > EPS) {
         const model = (m) => {
           const v = parts.map((u) => u.models.get(m) || 0);
-          const l = head.models.get(m) || 0;
-          const t = sum(v, (x) => x) + l;
-          return t > EPS ? { shares: v.map((x) => x / t), lost: l / t } : null;
+          const t = sum(v, (x) => x) + lost(m);
+          return t > EPS ? { shares: v.map((x) => x / t), lost: lost(m) / t } : null;
         };
-        return { by: "5h", shares: parts.map((u) => u.all / total), lost: head.all / total, model };
+        return { by: "5h", shares: parts.map((u) => u.all / total), lost: lost() / total, model };
       }
     }
     const plain = spans.map(([s, e]) => Math.max(0, e - s));
@@ -630,7 +655,7 @@
   };
 
   // 每 100% 周额度合多少（相对值）：从明细能覆盖到的最早一个周期起，已结算整天的用量 ÷ 这些周期已结算用量之和。
-  // 最早那天如果还混着更早周期的用量，按时长比例扣掉
+  // 只算属于这些周期的那部分：最早那天里更早周期的、历史里缺了的周期的用量都按 dayShares 扣掉
   const estimateQuota = (cycles, days, history, firstTs, now) => {
     const asOf = history?.asOf;
     if (!Number.isFinite(asOf)) return NaN;
@@ -639,13 +664,14 @@
     const from = dayOf(Math.min(...set.map((c) => c.start)));
     const settledDays = days.filter((d) => d.ts >= from && d.ts + DAY_MS <= asOf);
     if (settledDays.some((d) => d.total > EPS && !(unitsOf(d) > EPS))) return NaN;
-    let units = sum(settledDays, unitsOf);
-    const head = settledDays.find((d) => d.ts === from);
-    if (head) {
-      const owners = cycles.filter((c) => c.start < from + DAY_MS && c.until > from).sort((x, y) => x.start - y.start);
-      const { shares, lost } = dayShares(owners, from, history, now, true);
-      units -= unitsOf(head) * (lost + sum(owners, (c) => (set.includes(c) ? 0 : shares[owners.indexOf(c)])));
-    }
+    let units = 0;
+    settledDays.forEach((d) => {
+      const owners = cycles.filter((c) => c.start < d.ts + DAY_MS && c.until > d.ts).sort((x, y) => x.start - y.start);
+      if (!owners.length) return;
+      const { shares, lost } = dayShares(owners, d.ts, history, now, true);
+      const outside = lost + sum(owners, (c) => (set.includes(c) ? 0 : shares[owners.indexOf(c)]));
+      units += unitsOf(d) * Math.max(0, 1 - outside);
+    });
     const used = sum(set, (c) => c.settled);
     return used > 0.005 && units > EPS ? units / used : NaN;
   };
@@ -799,7 +825,8 @@
         m.approx = false;
       });
       officialMap.forEach((ratio, name) => {
-        if (countByModel.has(name)) return;
+        // 官网会列出用量为 0 的模型
+        if (countByModel.has(name) || !(ratio > 0)) return;
         models.push({
           model: name, speed: "standard", input: 0, cached: 0, output: 0, total: 0, credits: 0, usd: 0,
           unknownPricing: false, estimated: false, fallback: false, share: 0, quota: ratio, approx: false,
@@ -1134,7 +1161,7 @@
       <section class="ql-block">
         <div class="ql-block-head">
           <h3>模型</h3>
-          <p class="ql-hint">${v.quotaApprox ? "占周额度按实时比例近似" : "占周额度为官网数据"}${v.tokens > 0 ? "，Token 与金额为估算，点一行看计算" : ""}</p>
+          <p class="ql-hint">${v.quotaApprox ? "占周额度按实时比例近似" : "占周额度为官网数据"}${v.tokens > 0 ? (v.mode === "team" ? "，金额为估算，点一行看计算" : "，Token 与金额为估算，点一行看计算") : ""}</p>
         </div>
         <div class="ql-cols"><span></span><span>模型</span><span>占周额度</span><span>Tokens</span><span>折合金额</span></div>
         <div class="ql-rows">${rows}</div>
@@ -1251,7 +1278,7 @@
         <li>实时已用来自 ChatGPT 的限额接口，随用随变。</li>
         <li>已结算来自官网「套餐用量历史」，按 UTC 整点结算，所以会比实时少一截；两者之差就是还没结算的用量。</li>
         <li>各模型占周额度是官网数据；同一模型的 Standard 与 Fast 按当天的额度消耗比例拆开。</li>
-        <li>Token 来自每日统计。个人账号每天只有合计，多个模型时按各模型费率反推分配，所以是估算。</li>
+        <li>Token 来自每日统计。Team 工作区直接给出每个模型的 Token；个人账号每天只有合计，多个模型时按各模型费率反推分配，所以是估算。</li>
         <li>金额按 OpenAI API 公开价格折算，Fast 按 2.5 倍、Ultrafast 按 8 倍，只是等价参考，不是账单。</li>
         <li>整周推算等于已结算时段的金额除以同一时段的已用比例，也就是用满一周额度大约值多少。</li>
         <li>每日统计按 UTC 日期分，一天可能跨两个周期（比如提前重置那天）。这时按官网 5 小时窗口的用量把当天拆开（重置会让 5 小时窗口同时结束，所以分得准），Token 和金额跟着拆；还没结算的先用实时用量估，再不行就按时长估。</li>

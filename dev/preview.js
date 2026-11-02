@@ -7,6 +7,7 @@
 //   node dev/preview.js --reset          本周期中途用了额度重置卡（可与其他参数组合）
 //   node dev/preview.js --settled        同一个账号一天后，官网结算越过了重置时刻
 //   node dev/preview.js --month          生成的一个月用量，5 个周期加一次重置，对照真值核对每个周期分到的 credits
+//   node dev/preview.js --team           Team 账号（11/2 06:37Z 诊断），8 个提前结束的周期，历史里缺了一周
 //   node dev/preview.js --readme         重新生成 docs/screenshot*.png
 //
 // 默认夹具按 2026-10-31 的真实诊断信息和 v1.1 的 README 截图重建，时钟固定在那一刻（UTC+8 时区）。
@@ -528,6 +529,216 @@ const MONTH = (() => {
   };
 })();
 
+// Team 账号，2026-11-02 06:37Z 的诊断信息。每个窗口的起止和各模型用量、每天的 Token 合计是真的；
+// 每日明细里各模型的相对值是编的：把 5 小时窗口的用量摊到每天（窗口里越靠前用得越多），每天的换算比例在 0.85–1.15 倍之间浮动。
+// Team 接口有每个模型的 Token 但 credits 全是 0。官网历史里缺了 10/15 06:44 – 10/20 06:33 那个每周窗口，这里照原样缺着
+const TEAM = (() => {
+  const now = Date.parse("2026-11-02T06:37:04.332Z");
+  const asOf = Date.parse("2026-11-02T00:00:00Z");
+  const DAY = 86400000;
+  const WEEKLY = [
+    ["2026-11-01T06:51:50.433Z", "2026-11-08T06:51:50.433Z", false, {"gpt-6-astra": 1370, "gpt-6.1-sol": 303.7, "gpt-6.1-terra": 6.8}],
+    ["2026-10-28T06:36:19.159Z", "2026-11-01T06:51:23.393Z", false, {"gpt-6-luna": 4.5, "gpt-6.1-sol": 8550.3, "gpt-6.1-terra": 1445.8}],
+    ["2026-10-26T06:11:29.562Z", "2026-10-28T06:24:14Z", false, {"gpt-6-astra": 597.9, "gpt-6-luna": 0.6, "gpt-6.1-sol": 5629.6, "gpt-6.1-terra": 262.8}],
+    ["2026-10-25T06:13:43.819Z", "2026-10-26T05:58:48Z", true, {"gpt-5.6-terra": 1.7, "gpt-6-astra": 87.4, "gpt-6-luna": 0, "gpt-6-sol": 43.4, "gpt-6.1-sol": 506.1}],
+    ["2026-10-23T17:50:10.599Z", "2026-10-25T05:59:33Z", true, {"codex-auto-review": 0.8, "gpt-6-luna": 15, "gpt-6-sol": 75.1, "gpt-6.1-sol": 3267, "gpt-6.1-sol-wm": 70.1}],
+    ["2026-10-22T22:30:07.116Z", "2026-10-23T17:31:40Z", false, {"codex-auto-review": 0.3, "gpt-6-luna": 12.4, "gpt-6-sol": 0.7, "gpt-6.1-sol": 3658.2, "gpt-6.1-sol-wm": 59.1}],
+    ["2026-10-20T06:36:41.007Z", "2026-10-22T16:58:02Z", false, {"gpt-5.6-luna": 0.4, "gpt-6.1-sol": 6097}],
+    ["2026-10-13T05:36:01.337Z", "2026-10-15T06:12:36Z", false, {"gpt-5.6-luna": 0.2, "gpt-6-astra": 904.1, "gpt-6.1-sol": 1284.4}],
+    ["2026-10-12T11:43:23.506Z", "2026-10-13T04:56:31Z", false, {"gpt-5.6-luna": 0.5, "gpt-6-luna": 1.1, "gpt-6-sol": 41, "gpt-6.1-sol": 2665.1}],
+  ];
+  const SHORT = [
+    ["2026-11-01T12:56:12.698Z", "2026-11-01T17:56:12.698Z", {"gpt-6.1-sol": 625.5, "gpt-6.1-terra": 43.8}],
+    ["2026-11-01T06:51:23.393Z", "2026-11-01T11:51:22.756Z", {"gpt-6-astra": 8767.8, "gpt-6.1-sol": 1318.3}],
+    ["2026-10-31T06:51:23.667Z", "2026-10-31T11:51:23.667Z", {"gpt-6.1-sol": 1587}],
+    ["2026-10-31T01:00:22.192Z", "2026-10-31T06:00:22.192Z", {"gpt-6-luna": 14.8, "gpt-6.1-sol": 712.7, "gpt-6.1-terra": 148.7}],
+    ["2026-10-30T15:36:10.238Z", "2026-10-30T20:36:10.238Z", {"gpt-6.1-sol": 785.5, "gpt-6.1-terra": 649.5}],
+    ["2026-10-30T07:30:38.060Z", "2026-10-30T12:30:38.060Z", {"gpt-6.1-sol": 1048.9}],
+    ["2026-10-30T01:22:50.117Z", "2026-10-30T06:22:50.117Z", {"gpt-6.1-sol": 7369.7}],
+    ["2026-10-29T18:31:54.783Z", "2026-10-29T23:31:54.783Z", {"gpt-6.1-sol": 863.9}],
+    ["2026-10-29T13:31:21.534Z", "2026-10-29T18:31:21.534Z", {"gpt-6-luna": 13.4, "gpt-6.1-sol": 3406.1, "gpt-6.1-terra": 5335.8}],
+    ["2026-10-29T08:31:07.728Z", "2026-10-29T13:31:07.728Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 1334.3, "gpt-6.1-terra": 113.4}],
+    ["2026-10-29T03:30:58.342Z", "2026-10-29T08:30:58.342Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 4329, "gpt-6.1-terra": 73.9}],
+    ["2026-10-28T22:30:39.426Z", "2026-10-29T03:30:39.426Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 5981.3, "gpt-6.1-terra": 2931.8}],
+    ["2026-10-28T16:40:11.417Z", "2026-10-28T21:40:11.417Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 10031.1}],
+    ["2026-10-28T11:39:07.314Z", "2026-10-28T16:39:07.314Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 10124.4}],
+    ["2026-10-28T06:36:19.207Z", "2026-10-28T11:36:19.207Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 7127.6}],
+    ["2026-10-28T03:31:02.744Z", "2026-10-28T06:24:14Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 697.7}],
+    ["2026-10-27T22:30:58.268Z", "2026-10-28T03:30:58.268Z", {"gpt-6-luna": 0.1, "gpt-6.1-sol": 1441.2}],
+    ["2026-10-27T13:44:06.234Z", "2026-10-27T18:44:06.234Z", {"gpt-6-astra": 3826.6, "gpt-6-luna": 0.1, "gpt-6.1-sol": 5992.4}],
+    ["2026-10-27T08:43:37.360Z", "2026-10-27T13:43:37.360Z", {"gpt-6.1-sol": 3334.5}],
+    ["2026-10-27T03:35:22.879Z", "2026-10-27T08:35:22.879Z", {"gpt-6-luna": 0.3, "gpt-6.1-sol": 8330.2, "gpt-6.1-terra": 1682.2}],
+    ["2026-10-26T22:30:06.612Z", "2026-10-27T03:30:06.612Z", {"gpt-6-luna": 3.2, "gpt-6.1-sol": 64}],
+    ["2026-10-26T16:27:23.057Z", "2026-10-26T21:27:23.057Z", {"gpt-6.1-sol": 4581.8}],
+    ["2026-10-26T11:27:00.245Z", "2026-10-26T16:27:00.245Z", {"gpt-6.1-sol": 10142.3}],
+    ["2026-10-26T06:11:29.665Z", "2026-10-26T11:11:29.665Z", {"gpt-6.1-sol": 1445.5}],
+    ["2026-10-26T04:00:08.699Z", "2026-10-26T05:58:48Z", {"gpt-5.6-terra": 11, "gpt-6-luna": 0, "gpt-6.1-sol": 61.5}],
+    ["2026-10-25T22:30:07.361Z", "2026-10-26T03:30:07.361Z", {"gpt-6-astra": 559.6, "gpt-6-luna": 0, "gpt-6-sol": 2.3, "gpt-6.1-sol": 2814.6}],
+    ["2026-10-25T11:32:46.186Z", "2026-10-25T16:32:46.186Z", {"gpt-6-sol": 191, "gpt-6.1-sol": 362.9}],
+    ["2026-10-25T06:13:43.818Z", "2026-10-25T11:13:43.818Z", {"gpt-6-sol": 84.4}],
+    ["2026-10-25T03:50:28.643Z", "2026-10-25T05:59:33Z", {"gpt-6-sol": 218.7, "gpt-6.1-sol-wm": 194.7}],
+    ["2026-10-24T22:30:06.586Z", "2026-10-25T03:30:06.586Z", {"gpt-6-luna": 0, "gpt-6-sol": 78, "gpt-6.1-sol": 247.8}],
+    ["2026-10-24T16:39:10.517Z", "2026-10-24T21:39:10.517Z", {"gpt-6-sol": 40.4, "gpt-6.1-sol": 7412.6}],
+    ["2026-10-24T11:38:59.481Z", "2026-10-24T16:38:59.481Z", {"codex-auto-review": 5.2, "gpt-6-luna": 0.1, "gpt-6-sol": 143.6, "gpt-6.1-sol": 5925.5, "gpt-6.1-sol-wm": 253.8}],
+    ["2026-10-24T05:35:28.520Z", "2026-10-24T10:35:28.520Z", {"gpt-6.1-sol": 4696.2}],
+    ["2026-10-24T00:35:02.794Z", "2026-10-24T05:35:02.794Z", {"gpt-6-luna": 95.9, "gpt-6.1-sol": 2491.7}],
+    ["2026-10-23T17:50:10.620Z", "2026-10-23T22:50:10.620Z", {"gpt-6.1-sol": 134.8}],
+    ["2026-10-23T13:55:35.652Z", "2026-10-23T17:31:40Z", {"codex-auto-review": 1.7, "gpt-6-luna": 7.2, "gpt-6.1-sol": 9673, "gpt-6.1-sol-wm": 378.2}],
+    ["2026-10-23T08:55:17.262Z", "2026-10-23T13:55:17.262Z", {"gpt-6-luna": 71.8, "gpt-6-sol": 4.7, "gpt-6.1-sol": 6138.3}],
+    ["2026-10-23T03:45:51.050Z", "2026-10-23T08:45:51.050Z", {"gpt-6.1-sol": 7539.8}],
+    ["2026-10-22T22:30:07.235Z", "2026-10-23T03:30:07.235Z", {"gpt-6-luna": 0, "gpt-6.1-sol": 61.7}],
+    ["2026-10-22T16:58:02Z", "2026-10-22T17:02:59.556Z", {}],
+    ["2026-10-22T12:02:59.517Z", "2026-10-22T16:58:02Z", {"gpt-6.1-sol": 7823.2}],
+    ["2026-10-22T06:28:23.305Z", "2026-10-22T11:28:23.305Z", {"gpt-6.1-sol": 2240}],
+    ["2026-10-22T01:27:24.473Z", "2026-10-22T06:27:24.473Z", {"gpt-5.6-luna": 0.4, "gpt-6.1-sol": 9060.5}],
+    ["2026-10-21T17:45:21.770Z", "2026-10-21T22:45:21.770Z", {"gpt-5.6-luna": 0.4, "gpt-6.1-sol": 2095.5}],
+    ["2026-10-21T09:46:47.973Z", "2026-10-21T14:46:47.973Z", {"gpt-5.6-luna": 0.2, "gpt-6.1-sol": 951.9}],
+    ["2026-10-21T04:20:42.958Z", "2026-10-21T09:20:42.958Z", {"gpt-5.6-luna": 0.4, "gpt-6.1-sol": 4422.3}],
+    ["2026-10-20T23:19:50.145Z", "2026-10-21T04:19:50.145Z", {"gpt-6.1-sol": 1938}],
+    ["2026-10-20T16:58:05.926Z", "2026-10-20T21:58:05.926Z", {"gpt-6.1-sol": 1259.8}],
+    ["2026-10-20T11:57:33.688Z", "2026-10-20T16:57:33.688Z", {"gpt-5.6-luna": 0.9, "gpt-6.1-sol": 4962.4}],
+    ["2026-10-20T06:36:41.218Z", "2026-10-20T11:36:41.218Z", {"gpt-6.1-sol": 4266.9}],
+    ["2026-10-20T05:37:53.563Z", "2026-10-20T06:33:06Z", {"gpt-6.1-sol": 3287.4}],
+    ["2026-10-20T00:32:31.694Z", "2026-10-20T05:32:31.694Z", {"codex-auto-review": 17.8, "gpt-5.6-luna": 0.3, "gpt-6.1-sol": 5161.4, "gpt-6.1-sol-wm": 1021.3}],
+    ["2026-10-19T13:40:20.424Z", "2026-10-19T18:40:20.424Z", {"gpt-5.6-luna": 0.4, "gpt-6-astra": 700, "gpt-6.1-sol": 4844.4}],
+    ["2026-10-19T06:08:39.210Z", "2026-10-19T11:08:39.210Z", {"gpt-6.1-sol": 10039}],
+    ["2026-10-19T01:08:38.236Z", "2026-10-19T06:08:38.236Z", {"gpt-6.1-sol": 6866}],
+    ["2026-10-18T16:07:22.140Z", "2026-10-18T21:07:22.140Z", {"gpt-6.1-sol": 546.2}],
+    ["2026-10-18T11:07:06.964Z", "2026-10-18T16:07:06.964Z", {"gpt-5.6-luna": 0.3, "gpt-6.1-sol": 4734.8}],
+    ["2026-10-18T05:29:51.197Z", "2026-10-18T10:29:51.197Z", {"gpt-5.6-luna": 1.2, "gpt-6.1-sol": 317.6}],
+    ["2026-10-18T00:28:56.893Z", "2026-10-18T05:28:56.893Z", {"gpt-5.6-luna": 0.6, "gpt-6.1-sol": 1007.1}],
+    ["2026-10-17T01:43:25.322Z", "2026-10-17T06:43:25.322Z", {"gpt-5.6-luna": 1, "gpt-6.1-sol": 3161.5}],
+    ["2026-10-16T14:54:59.555Z", "2026-10-16T19:54:59.555Z", {"gpt-6.1-sol": 1635}],
+    ["2026-10-16T05:55:18.563Z", "2026-10-16T10:55:18.563Z", {"gpt-5.6-luna": 2.8, "gpt-6.1-sol": 9724}],
+    ["2026-10-15T17:06:54.598Z", "2026-10-15T22:06:54.598Z", {"gpt-6.1-sol": 32.6}],
+    ["2026-10-15T11:55:42.659Z", "2026-10-15T16:55:42.659Z", {"gpt-6-luna": 27.1, "gpt-6.1-sol": 3591.9}],
+    ["2026-10-15T06:44:02.740Z", "2026-10-15T11:44:02.740Z", {"gpt-5.6-luna": 1, "gpt-6.1-sol": 3851.1}],
+    ["2026-10-15T06:07:02.461Z", "2026-10-15T06:12:36Z", {"gpt-5.6-luna": 0.6, "gpt-6.1-sol": 267.4}],
+    ["2026-10-14T09:25:33.541Z", "2026-10-14T14:25:33.541Z", {"gpt-6.1-sol": 181.2}],
+    ["2026-10-14T01:46:52.372Z", "2026-10-14T06:46:52.372Z", {"gpt-5.6-luna": 0.4, "gpt-6.1-sol": 204.3}],
+    ["2026-10-13T11:24:26.438Z", "2026-10-13T16:24:26.438Z", {"gpt-6.1-sol": 3333.3}],
+    ["2026-10-13T05:36:01.337Z", "2026-10-13T10:36:01.337Z", {"gpt-5.6-luna": 0.3, "gpt-6-astra": 5786, "gpt-6.1-sol": 4233.8}],
+    ["2026-10-13T00:20:08.687Z", "2026-10-13T04:56:31Z", {"gpt-5.6-luna": 0.5, "gpt-6.1-sol": 5688.2}],
+    ["2026-10-12T17:30:29.806Z", "2026-10-12T22:30:29.806Z", {"gpt-6.1-sol": 2312.7}],
+    ["2026-10-12T11:43:23.506Z", "2026-10-12T16:43:23.506Z", {"gpt-5.6-luna": 3, "gpt-6-luna": 7, "gpt-6-sol": 262.5, "gpt-6.1-sol": 9055.6}],
+  ];
+  const TOKENS = {"2026-10-12": 33371874, "2026-10-13": 35575995, "2026-10-14": 191020, "2026-10-15": 36197763, "2026-10-16": 51040050, "2026-10-17": 8653487, "2026-10-18": 28707518, "2026-10-19": 85464209, "2026-10-20": 84427511, "2026-10-21": 30742836, "2026-10-22": 79090158, "2026-10-23": 83987418, "2026-10-24": 78655278, "2026-10-25": 1860857, "2026-10-26": 44375294, "2026-10-27": 59327509, "2026-10-28": 71395535, "2026-10-29": 85022011, "2026-10-30": 53669248, "2026-10-31": 12241449, "2026-11-01": 12004862};
+  // 11/2 还没进历史：实时 19% − 已结算 16.81%，按 5 小时 : 每周 ≈ 6 折成一个窗口
+  const TODAY = ["2026-11-02T04:17:13Z", "2026-11-02T06:37:04Z", { "gpt-6.1-sol": 1314 }];
+  const TOKENS_TODAY = 9000000;
+  // 每 1 bp 的 5 小时额度大约合多少 credits，以及编 Token 用的相对费率
+  const PER_BP = 0.05;
+  const RATE = { "gpt-6-astra": 5, "gpt-6-sol": 1, "gpt-6.1-sol": 1, "gpt-6.1-sol-wm": 1, "gpt-6.1-terra": 0.5, "gpt-5.6-terra": 1, "gpt-5.6-luna": 0.1, "gpt-6-luna": 0.05, "codex-auto-review": 1 };
+  // 10/27 的 gpt-6.1-sol 有 42% 是 Fast（诊断里的每日明细）
+  const FAST = { "2026-10-27": { "gpt-6.1-sol": 0.42 } };
+  let seed = 1102;
+  const rand = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  const iso = (ms) => new Date(ms).toISOString();
+  const factor = new Map();
+  for (let t = Date.parse("2026-10-04T00:00:00Z"); t <= asOf; t += DAY) factor.set(t, 0.85 + rand() * 0.3);
+  const weeks = WEEKLY.map(([s, e]) => ({ start: Date.parse(s), end: Date.parse(e), credits: 0 }));
+  // 窗口属于哪个周期：开始时刻落在里面的那个（边界容差 60 秒，靠后的优先）；都不落就是历史里缺的那个周期
+  const owner = (t) => weeks.filter((w) => w.start - 60000 <= t && t < w.end).sort((a, b) => b.start - a.start)[0];
+  const share = (x) => 2 * x - x * x;
+  const perDay = new Map();
+  [...SHORT, TODAY].forEach(([s, e, models]) => {
+    const start = Date.parse(s);
+    const end = Date.parse(e);
+    const len = end - start;
+    if (len <= 0) return;
+    const o = owner(start);
+    for (let d = Math.floor(start / DAY) * DAY; d < end; d += DAY) {
+      const f = share((Math.min(end, d + DAY) - start) / len) - share((Math.max(start, d) - start) / len);
+      if (f <= 0) continue;
+      const date = iso(d).slice(0, 10);
+      const bucket = perDay.get(date) || {};
+      Object.entries(models).forEach(([m, bp]) => {
+        const c = bp * f * factor.get(d) * PER_BP;
+        bucket[m] = (bucket[m] || 0) + c;
+        if (o) o.credits += c;
+      });
+      perDay.set(date, bucket);
+    }
+  });
+  const dates = [...perDay.keys()].sort();
+  const breakdown = dates.map((date) => {
+    const models = {};
+    Object.entries(perDay.get(date)).forEach(([m, c]) => {
+      const fast = FAST[date]?.[m] || 0;
+      if (c * (1 - fast) > 0) models[m] = c * (1 - fast);
+      if (fast) models[`${m}:fast`] = c * fast;
+    });
+    return day(date, models, { cli: Object.values(models).reduce((a, b) => a + b, 0) });
+  });
+  const team = breakdown.map((row) => {
+    const total = row.date === "2026-11-02" ? TOKENS_TODAY : TOKENS[row.date] || 0;
+    const weight = row.models.map((m) => m.credits / (RATE[m.model] || 1) / (m.speed === "fast" ? 2.5 : 1));
+    const all = weight.reduce((a, b) => a + b, 0) || 1;
+    return {
+      date: row.date,
+      product_surface_usage_values: {},
+      models: row.models.map((m, i) => {
+        const t = Math.round((total * weight[i]) / all);
+        const input = Math.round(t * 0.063);
+        const output = Math.round(t * 0.006);
+        return { model: m.model, speed: m.speed, credits: 0, on_demand_credits: 0, ...tokens(input, t - input - output, output) };
+      }),
+    };
+  });
+  const max = Math.max(...breakdown.map((r) => r.models.reduce((a, m) => a + m.credits, 0)));
+  const period = ([s, e, complete, models], minutes) => {
+    const bp = Object.values(models).reduce((a, b) => a + b, 0);
+    return {
+      window_minutes: minutes,
+      plan_type: "team",
+      starts_at: s,
+      ends_at: e,
+      accounting_complete: complete,
+      used_basis_points: bp,
+      breakdowns: [
+        { dimension: "model", rows: rows(Object.entries(models)) },
+        { dimension: "thread_source", rows: rows([["user", bp]]) },
+        { dimension: "surface", rows: rows([["cli", bp]]) },
+      ],
+    };
+  };
+  return {
+    now,
+    team,
+    usage: () => ({
+      ...resetUsage(),
+      plan_type: "team",
+      account_id: ACCOUNT_ID,
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: { used_percent: 17, limit_window_seconds: 18000, reset_after_seconds: 9612, reset_at: 1793611033 },
+        secondary_window: { used_percent: 19, limit_window_seconds: 604800, reset_after_seconds: 519288, reset_at: 1794120710 },
+      },
+      rate_limit_reset_credits: { available_count: 1, applicable_available_count: 0 },
+    }),
+    history: () => ({
+      data_as_of: iso(asOf).replace(".000Z", "Z"),
+      coverage_start: "2026-10-03T00:00:00Z",
+      coverage_complete: false,
+      approximate: true,
+      boundary_tolerance_seconds: 60,
+      periods: [
+        ...WEEKLY.map((w) => period(w, 10080)),
+        ...SHORT.map(([s, e, models]) => period([s, e, Date.parse(e) <= asOf, models], 300)),
+      ].sort((a, b) => b.starts_at.localeCompare(a.starts_at)),
+    }),
+    breakdown,
+    totals: [],
+    // 每日明细是按区间里用量最多的那天 = 100 归一化的，真值也换成同样的单位
+    relativeTruth: true,
+    truth: weeks.map((w) => ({ start: w.start, credits: (w.credits / max) * 100, recent: (w.credits / max) * 100 })),
+  };
+})();
+
 const inRange = (list, url) => {
   const from = url.searchParams.get("start_date") || "0000-00-00";
   const to = url.searchParams.get("end_date") || "9999-99-99";
@@ -575,7 +786,10 @@ function backend(url, headers, opts) {
     }
     return [200, S.history()];
   }
-  if (p === "/backend-api/wham/usage/daily-workspace-user-token-usage-breakdown") return [400, { detail: "No active workspace found" }];
+  if (p === "/backend-api/wham/usage/daily-workspace-user-token-usage-breakdown") {
+    if (!S.team) return [400, { detail: "No active workspace found" }];
+    return [200, { data: inRange(S.team, url), units: "credits", data_freshness_ts: "2026-11-02T04:00:00Z", group_by: "day" }];
+  }
   if (p === "/backend-api/wham/usage/daily-token-usage-breakdown") return [200, { units: "percent", data: normalize(fillDays(S.breakdown, url)) }];
   if (p === "/backend-api/wham/analytics/daily-workspace-usage-counts") return [200, { data: inRange(S.totals, url), balance_unit: "credit", group_by: "day" }];
   if (p === "/backend-api/wham/rate-limit-reset-credits") return [200, resetCredits()];
@@ -795,7 +1009,8 @@ function report(label, { views, requests, problems, saved, diag }, opts) {
       const unit = computed.unit === "credits" ? "credits" : "（相对值）";
       console.log(`换算    每 100% 周额度 ${computed.per100 ?? "—"} ${unit}`);
       computed.cycles.forEach((c) => {
-        const truth = computed.unit === "credits" && opts.scenario?.truth?.find((t) => Math.abs(t.start - Date.parse(c.start)) < 60000);
+        const comparable = computed.unit === "credits" || opts.scenario?.relativeTruth;
+        const truth = comparable && opts.scenario?.truth?.find((t) => Math.abs(t.start - Date.parse(c.start)) < 60000);
         const real = truth && (c.partial ? truth.recent : truth.credits);
         const diff = real > 0 ? `差 ${(((c.amount - real) / real) * 100).toFixed(1)}%` : `差 ${(c.amount - real).toFixed(1)}`;
         const versus = truth ? `（实际${c.partial ? "（30 天内）" : ""} ${Math.round(real)}，${diff}）` : "";
@@ -832,8 +1047,8 @@ function report(label, { views, requests, problems, saved, diag }, opts) {
     }
     return;
   }
-  const name = ["reset", "settled", "month"].find((k) => args.has(`--${k}`)) || "";
-  const scenario = { reset: RESET, settled: SETTLED, month: MONTH }[name] || BASE;
+  const name = ["reset", "settled", "month", "team"].find((k) => args.has(`--${k}`)) || "";
+  const scenario = { reset: RESET, settled: SETTLED, month: MONTH, team: TEAM }[name] || BASE;
   const opts = { mobile: args.has("--mobile"), dark: args.has("--dark"), noHistory: args.has("--no-history"), scenario };
   const tag = [opts.mobile ? "mobile" : "desktop", opts.dark ? "dark" : "light", name, opts.noHistory ? "nohistory" : ""]
     .filter(Boolean)
