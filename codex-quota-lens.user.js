@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex 额度透镜
 // @namespace    codex-quota-lens
-// @version      1.1
+// @version      1.2
 // @description  在 ChatGPT 用量页查看 Codex 周额度：实时与已结算用量、用量节奏、各模型与来源占比，以及折合 API 价格的估算。
 // @author       Wren, Claude
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   if (window.__codexQuotaLens) return;
   window.__codexQuotaLens = true;
 
-  const VERSION = "1.1";
+  const VERSION = "1.2";
   const TARGET_PATHS = ["/settings/usage", "/codex/cloud/settings/analytics"];
   const DAY_MS = 86400000;
   const WEEK_SECONDS = 604800;

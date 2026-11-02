@@ -13,6 +13,7 @@
 - **用量节奏**：额度条上标出本周时间已经过去多少，并按当前速度估算额度什么时候用完。
 - **各模型占周额度**：直接取官网「套餐用量历史」的数据，同一模型的 Standard 与 Fast 分开列。
 - **折合 API 价格**：按 OpenAI API 公开价格估算已用部分值多少钱，并推算整周。点任意模型可以看到计算过程。
+- **按周期查看**：用 ‹ › 切换过去 30 天里的每个周期，看每周用了多少、花在哪些模型上。用额度重置卡提前结束的周期会单独列出，标「提前重置」。
 - **更多细节**：5 小时窗口、历史额度窗口、用量来源（包括记忆整理这类后台任务）、每日明细。
 - 支持深色模式，手机上也能正常查看。
 
@@ -41,10 +42,12 @@
 | 接口 | 用途 |
 | --- | --- |
 | `/backend-api/wham/usage` | 实时已用比例、窗口重置时间 |
-| `/backend-api/wham/usage/plan_limit_history` | 官网「套餐用量历史」：已结算比例、各模型与来源的占比 |
+| `/backend-api/wham/accounts/check` | 账号 ID，查询官网用量历史时要带上 |
+| `/backend-api/wham/usage/plan_limit_history` | 官网「套餐用量历史」（最近 30 天）：每个周期的起止、已结算比例、各模型与来源的占比 |
 | `/backend-api/wham/usage/daily-token-usage-breakdown` | 每天各模型的相对消耗 |
 | `/backend-api/wham/analytics/daily-workspace-usage-counts` | 每天的 Token 合计 |
 | `/backend-api/wham/usage/daily-workspace-user-token-usage-breakdown` | Team 工作区的模型级 Token |
+| `/backend-api/wham/rate-limit-reset-credits` | 只在导出诊断信息时请求，记录手上的额度重置卡 |
 
 这些都是 ChatGPT 网页自己使用的非公开接口，没有官方文档，随时可能变化。
 
@@ -53,6 +56,8 @@
 - 个人账号的每日统计只有 Token 合计。一天里用了多个模型时，脚本按各模型的费率把合计反推分配到每个模型，所以模型级的 Token 和金额是估算值。
 - 金额按 OpenAI API 标准价折算，Fast 按 2.5 倍、Ultrafast 按 8 倍（Codex 订阅额度口径）。它只是等价参考，不是账单。价格表在脚本开头的 `PRICES` 里，来源是 [OpenAI API 定价](https://developers.openai.com/api/docs/pricing) 和 [Codex 速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)。
 - 整周推算 = 已结算时段的金额 ÷ 同一时段的已用比例。
+- 每日明细按 UTC 日统计，一天可能跨两个周期，比如用了重置卡的那天。已结算的部分按官网 5 小时窗口的用量拆开；还没结算的只能估算，界面上标「大约」或 ≈，等官网结算后会换成准确的数。
+- 每日明细最多查 30 天。最早那个周期如果开头超出了这个范围，它的 Token 和金额不全，不做推算。
 
 ## 隐私
 
