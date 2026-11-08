@@ -8,6 +8,7 @@
 //   node dev/preview.js --settled        同一个账号一天后，官网结算越过了重置时刻
 //   node dev/preview.js --month          生成的一个月用量，5 个周期加一次重置，对照真值核对每个周期分到的 credits
 //   node dev/preview.js --team           Team 账号（11/2 06:37Z 诊断），8 个提前结束的周期，历史里缺了一周
+//   node dev/preview.js --limited        Plus 账号（11/8 诊断），周期自然结束后新周期刚开始，5 小时额度已用完
 //   node dev/preview.js --readme         重新生成 docs/screenshot*.png
 //
 // 默认夹具按 2026-10-31 的真实诊断信息和 v1.1 的 README 截图重建，时钟固定在那一刻（UTC+8 时区）。
@@ -389,6 +390,161 @@ const SETTLED = {
   breakdown: [...RESET_BREAKDOWN.slice(0, 3), day("2026-11-01", { "gpt-6.1-sol": 340.9, "gpt-6-luna": 0.4 })],
   totals: [...RESET_TOTALS.slice(0, 3), counts("2026-11-01", 341.3, 3405212, 86512640, 198016)],
 };
+
+// 同一个 Plus 账号 2026-11-08 10:08Z 的诊断：上个周期 11/8 05:12:43 自然结束，新周期 08:08:36 第一次使用才开始，
+// 5 小时窗口同一刻开始，两小时就用满了（allowed: false），周额度才 16%。官网结算到 11/8 00:00，11/8 的每日明细还没出来。
+// 时钟拨到 11:45Z：5 小时额度用完期间不会有新用量，wham 的数值不变，时间进度过了 2% 才会显示用完时间，
+// 这时按平均速度外推是 11/9 06:44Z，比每个 5 小时窗口都用满还快，应显示最早 11/9 14:09Z。
+// 11/2 之后的 5 小时窗口和各维度用量是真的（两个被打码的来源换成了占位名），每周窗口按「5 小时窗口合计 × 0.15625」
+// 推出来，和官网的 6731.4 bp 一致；每日明细各模型的相对值、每天的 credits 和 Token 合计是真的，
+// 10/16、11/5–11/7 三类 Token 怎么分是照 11/4 的比例编的
+const LIMITED_NOW = Date.parse("2026-11-08T11:45:00Z");
+const limitedUsage = () => ({
+  ...resetUsage(),
+  rate_limit: {
+    allowed: false,
+    limit_reached: true,
+    primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_after_seconds: 1794143316 - LIMITED_NOW / 1000, reset_at: 1794143316 },
+    secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_after_seconds: 1794730116 - LIMITED_NOW / 1000, reset_at: 1794730116 },
+  },
+  model_usage: { "gpt-6-astra": { available: false, available_at: "2026-11-08T13:08:36.990724Z", credits_would_enable: true } },
+  credits: { has_credits: false, unlimited: false, overage_limit_reached: false, balance: "0", approx_local_messages: [0, 0], approx_cloud_messages: [0, 0] },
+  spend_control: { reached: false, individual_limit: null },
+  rate_limit_reached_type: { type: "rate_limit_reached", details: "default" },
+  rate_limit_upsell: {
+    banner_type: "plus_rate_limit_reached",
+    title: "你的 Codex 消息额度已用完",
+    description: "你的速率限制将于 {time} 重置。立即升级，或使用一次速率限制重置机会。",
+    ctas: [{ action: "open_pricing_dialog", label: "升级" }, { action: "reset_usage", label: "重置使用量" }],
+    reset_at: 1794143316,
+    referral: null,
+    request_url: null,
+  },
+  promo: null,
+  rate_limit_reset_credits: { available_count: 1, applicable_available_count: 1 },
+});
+const SHORT_TO_WEEKLY = 0.15625;
+// 维度顺序和官网一样：thread_source、turn_trigger、model、surface；used_basis_points 等于 model 合计
+const pw = (start, end, complete, [ts, tt, models, surface]) => ({
+  window_minutes: 300,
+  plan_type: "plus",
+  starts_at: start,
+  ends_at: end,
+  accounting_complete: complete,
+  used_basis_points: Object.values(models).reduce((a, b) => a + b, 0),
+  breakdowns: [
+    { dimension: "thread_source", rows: rows(Object.entries(ts)) },
+    { dimension: "turn_trigger", rows: rows(Object.entries(tt)) },
+    { dimension: "model", rows: rows(Object.entries(models)) },
+    { dimension: "surface", rows: rows(Object.entries(surface)) },
+  ],
+});
+const LIMITED_SHORT = [
+  pw("2026-11-07T14:51:57.461000Z", "2026-11-07T19:51:57.461000Z", true, [
+    { thread_title: 0.2124096, user: 1686.584 }, { user: 1686.584 },
+    { "gpt-5.6-luna": 0.2124096, "gpt-6-astra": 1686.584 }, { cli: 1686.7964096 },
+  ]),
+  pw("2026-11-07T09:50:38.383000Z", "2026-11-07T14:50:38.383000Z", true, [
+    { thread_title: 0.5298252, user: 7269.255292 }, { composer: 2237.182, user: 5032.073292 },
+    { "gpt-5.6-luna": 0.5298252, "gpt-6-astra": 6835.978, "gpt-6.1-sol": 433.277292 }, { cli: 5032.6031172, work_web: 2237.182 },
+  ]),
+  // 用超 100% 的窗口，又是 accounting_complete: false
+  pw("2026-11-07T02:44:17.428000Z", "2026-11-07T07:44:17.428000Z", false, [
+    { ambient_suggestions: 5.331904, thread_title: 0.4068372, user: 10072.082552 }, { user: 10072.082552 },
+    { "gpt-5.6-luna": 0.4068372, "gpt-6-astra": 9832.158, "gpt-6-luna": 5.331904, "gpt-6.1-sol": 239.924552 },
+    { cli: 9881.6429012, desktop_app: 5.331904, work_mobile: 190.846488 },
+  ]),
+  pw("2026-11-06T04:10:04.383000Z", "2026-11-06T09:10:04.383000Z", true, [
+    { ambient_suggestions: 4.58144, memory_consolidation: 305.360334, thread_title: 1.11392, user: 1189.744332 }, { composer: 849.45, user: 340.294332 },
+    { "gpt-5.6-luna": 23.827926, "gpt-5.6-terra": 281.532408, "gpt-6-astra": 849.45, "gpt-6-luna": 5.69536, "gpt-6.1-sol": 340.294332 },
+    { desktop_app: 1160.505694, work_mobile: 340.294332 },
+  ]),
+  pw("2026-11-05T05:41:21.959000Z", "2026-11-05T10:41:21.959000Z", true, [
+    { ambient_suggestions: 5.784288 }, {}, { "gpt-6-luna": 5.784288 }, { desktop_app: 5.784288 },
+  ]),
+  pw("2026-11-04T17:32:53.944000Z", "2026-11-04T22:32:53.944000Z", true, [
+    { user: 411.12162 }, { user: 411.12162 }, { "gpt-6.1-sol": 411.12162 }, { work_mobile: 411.12162 },
+  ]),
+  pw("2026-11-04T06:42:49.325000Z", "2026-11-04T11:42:49.325000Z", true, [
+    { user: 3851.98468 }, { composer: 3851.98468 }, { "gpt-6-astra": 3632.274, "gpt-6.1-sol": 219.71068 }, { work_web: 3851.98468 },
+  ]),
+  pw("2026-11-03T17:25:51.825000Z", "2026-11-03T22:25:51.825000Z", true, [
+    { ambient_suggestions: 5.48208, memory_consolidation: 237.377274, thread_title: 1.1104, user: 1252.617028 },
+    { composer: 1219.67346, remote_ios: 7.368732, user: 25.574836 },
+    { "gpt-5.6-luna": 57.959982, "gpt-5.6-terra": 179.417292, "gpt-6-luna": 6.59248, "gpt-6.1-sol": 32.943568, "gpt-6.1-terra": 1219.67346 },
+    { desktop_app: 1463.643214, unknown: 7.368732, work_mobile: 25.574836 },
+  ]),
+  pw("2026-11-03T12:18:53.145000Z", "2026-11-03T17:18:53.145000Z", true, [
+    { user: 145.771192 }, { composer: 86.88092, user: 58.890272 }, { "gpt-6.1-sol": 145.771192 }, { desktop_app: 86.88092, work_mobile: 58.890272 },
+  ]),
+  pw("2026-11-03T05:32:46.118000Z", "2026-11-03T10:32:46.118000Z", true, [
+    { ambient_suggestions: 4.94624, memory_consolidation: 542.0855496, thread_title: 1.096, user: 3003.159684 },
+    { composer: 2971.673264, preview_placeholder_turn_trigger: 31.48642 },
+    { "gpt-5.6-luna": 76.2642816, "gpt-5.6-terra": 465.821268, "gpt-6-luna": 6.04224, "gpt-6.1-sol": 3003.159684 },
+    { desktop_app: 3551.2874736 },
+  ]),
+  pw("2026-11-02T13:59:46.765000Z", "2026-11-02T18:59:46.765000Z", true, [
+    { user: 571.444076 }, { composer: 400.134224, user: 171.309852 }, { "gpt-6.1-sol": 571.444076 }, { desktop_app: 400.134224, work_mobile: 171.309852 },
+  ]),
+  pw("2026-11-02T08:04:46.620000Z", "2026-11-02T13:04:46.620000Z", true, [
+    { preview_placeholder_source: 0.616192, ambient_suggestions: 17.428672, memory_consolidation: 737.6955216, thread_title: 2.16128, user: 2368.392712 },
+    { composer: 2127.793052, resume_interrupted_task: 240.59966 },
+    { "gpt-5.6-luna": 156.3281376, "gpt-5.6-terra": 581.367384, "gpt-6-luna": 20.206144, "gpt-6.1-sol": 2368.392712 },
+    { desktop_app: 3126.2943776 },
+  ]),
+];
+const limitedHistory = () => {
+  const h = settledHistory();
+  const week = h.periods.find((p) => p.window_minutes === 10080 && p.starts_at.startsWith("2026-11-01"));
+  // 11/1 那两个窗口只有模型维度；来源沿用 11/2 诊断里这个周期当时的数（就是那两个窗口的）
+  const add = (dimension, into) => {
+    LIMITED_SHORT.forEach((p) =>
+      p.breakdowns.find((b) => b.dimension === dimension).rows.forEach((r) => {
+        into[r.key] = (into[r.key] || 0) + r.basis_points * SHORT_TO_WEEKLY;
+      }),
+    );
+    return rows(Object.entries(into));
+  };
+  const own = (dimension) => Object.fromEntries(week.breakdowns.find((b) => b.dimension === dimension).rows.map((r) => [r.key, r.basis_points]));
+  const models = add("model", own("model"));
+  // 11/2 的诊断里这个周期从 05:12:43.829 开始，11/8 的变成了 .682
+  Object.assign(week, {
+    starts_at: "2026-11-01T05:12:43.682000Z",
+    ends_at: "2026-11-08T05:12:43.682000Z",
+    accounting_complete: false,
+    used_basis_points: models.reduce((a, r) => a + r.basis_points, 0),
+    breakdowns: [{ dimension: "model", rows: models }, { dimension: "thread_source", rows: add("thread_source", own("thread_source")) }],
+  });
+  return { ...h, data_as_of: "2026-11-08T00:00:00Z", coverage_start: "2026-10-09T00:00:00Z", periods: [...LIMITED_SHORT, ...h.periods] };
+};
+// 诊断信息里各模型的相对值（30 天里 10/31 最多，记为 100）
+const LIMITED_BREAKDOWN = [
+  day("2026-10-16", { "gpt-6-luna": 0.01 }),
+  day("2026-10-29", {
+    "gpt-6.1-sol": 2.9, "gpt-6.1-sol:fast": 0.93, "gpt-6-astra": 56.76, "gpt-6-astra:fast": 3.47, "gpt-6-sol": 1.53,
+    "gpt-5.6-terra": 2.9, "gpt-5.6-luna": 2.28, "gpt-6-luna": 0.1,
+  }),
+  day("2026-10-30", { "gpt-6.1-sol": 6.07, "gpt-6-astra": 1.54, "gpt-6-sol": 10.33, "gpt-5.6-terra": 4.12, "gpt-5.6-luna": 0.28 }),
+  day("2026-10-31", { "gpt-6.1-sol": 96.16, "gpt-5.6-terra": 3.06, "gpt-5.6-luna": 0.73, "gpt-6-luna": 0.05 }),
+  day("2026-11-01", { "gpt-6.1-sol": 47.55, "gpt-6-luna": 0.03 }),
+  day("2026-11-02", { "gpt-6.1-sol": 8.66, "gpt-5.6-terra": 1.94, "gpt-5.6-luna": 0.49, "gpt-6-luna": 0.05 }),
+  day("2026-11-03", { "gpt-6.1-sol": 11.65, "gpt-6.1-terra": 2.26, "gpt-5.6-terra": 2.15, "gpt-5.6-luna": 0.42, "gpt-6-luna": 0.03 }),
+  day("2026-11-04", { "gpt-6.1-sol": 1.94, "gpt-6-astra": 13.49 }),
+  day("2026-11-05", { "gpt-6-luna": 0.01 }),
+  day("2026-11-06", { "gpt-6.1-sol": 0.89, "gpt-6-astra": 3.19, "gpt-5.6-terra": 0.97, "gpt-5.6-luna": 0.07, "gpt-6-luna": 0.01 }),
+  day("2026-11-07", { "gpt-6.1-sol": 1.93, "gpt-6-astra": 70.86, "gpt-6-luna": 0.01 }),
+];
+const LIMITED_TOTALS = [
+  counts("2026-10-16", 0.1, 6569, 126176, 1070),
+  ...SETTLED.totals,
+  counts("2026-11-02", 79.92631, 1351706, 12268288, 67103),
+  counts("2026-11-03", 118.3895065, 1396847, 27098496, 96031),
+  counts("2026-11-04", 110.66535, 239571, 4601728, 39032),
+  counts("2026-11-05", 0.1, 5309, 101985, 865),
+  counts("2026-11-06", 36.8, 97662, 1875907, 15912),
+  counts("2026-11-07", 522.3, 696447, 13377494, 113468),
+];
+const LIMITED = { now: LIMITED_NOW, usage: limitedUsage, history: limitedHistory, breakdown: LIMITED_BREAKDOWN, totals: LIMITED_TOTALS };
 
 // 生成一个月的用量，周期、5 小时窗口和官网历史都按真实规则推出来，用来核对脚本算出的每个周期 credits。
 // 每 100% 周额度合 2000 credits；10/27 15:30 用了重置卡；最早那个周期从 9 月底开始，只有一部分在 30 天明细里。
@@ -842,6 +998,7 @@ const summarize = () => {
           quotaApprox: v.quotaApprox,
           quotaTotal: v.quotaTotal,
           quotaSum: v.models.reduce((a, m) => a + m.quota, 0),
+          modelCount: v.models.length,
         }
       : null,
   };
@@ -981,13 +1138,18 @@ function reportView(s) {
   console.log(`折叠    ${s.folds.join(" ／ ")}`);
 
   if (!s.check) return;
-  const { current, settled, hasSettled, live, quotaApprox, quotaTotal, quotaSum } = s.check;
-  // 有官网模型数据时合计应等于已结算；近似时等于已结算（大于 0 时）或实时
+  const { current, settled, hasSettled, live, quotaApprox, quotaTotal, quotaSum, modelCount } = s.check;
+  // 有官网模型数据时合计应等于已结算；近似时等于已结算（大于 0 时）或实时。
+  // 新周期的每日明细还没出来时没有模型，面板也不显示合计行
   const target = quotaApprox ? (hasSettled && settled > 1e-9 ? settled : live) : settled;
   const label = quotaApprox ? (hasSettled && settled > 1e-9 ? "已结算（近似）" : "实时（近似）") : "已结算";
-  const ok = Math.abs(quotaSum - target) < 1e-6 && Math.abs(quotaTotal - target) < 1e-6;
-  console.log(`核对    模型占周额度合计 ${(quotaSum * 100).toFixed(3)}%，${label} ${(target * 100).toFixed(3)}%  ${ok ? "一致" : "不一致！"}`);
-  if (!ok) process.exitCode = 1;
+  if (!modelCount) {
+    console.log("核对    还没有模型数据，跳过合计核对");
+  } else {
+    const ok = Math.abs(quotaSum - target) < 1e-6 && Math.abs(quotaTotal - target) < 1e-6;
+    console.log(`核对    模型占周额度合计 ${(quotaSum * 100).toFixed(3)}%，${label} ${(target * 100).toFixed(3)}%  ${ok ? "一致" : "不一致！"}`);
+    if (!ok) process.exitCode = 1;
+  }
   // wham 的 used_percent 是整数，允许 1% 的误差
   if (current && hasSettled && settled > live + 0.01) {
     console.log(`核对    已结算 ${(settled * 100).toFixed(1)}% 高于实时 ${(live * 100).toFixed(1)}%，周期很可能匹配错了！`);
@@ -1047,8 +1209,8 @@ function report(label, { views, requests, problems, saved, diag }, opts) {
     }
     return;
   }
-  const name = ["reset", "settled", "month", "team"].find((k) => args.has(`--${k}`)) || "";
-  const scenario = { reset: RESET, settled: SETTLED, month: MONTH, team: TEAM }[name] || BASE;
+  const name = ["reset", "settled", "month", "team", "limited"].find((k) => args.has(`--${k}`)) || "";
+  const scenario = { reset: RESET, settled: SETTLED, month: MONTH, team: TEAM, limited: LIMITED }[name] || BASE;
   const opts = { mobile: args.has("--mobile"), dark: args.has("--dark"), noHistory: args.has("--no-history"), scenario };
   const tag = [opts.mobile ? "mobile" : "desktop", opts.dark ? "dark" : "light", name, opts.noHistory ? "nohistory" : ""]
     .filter(Boolean)

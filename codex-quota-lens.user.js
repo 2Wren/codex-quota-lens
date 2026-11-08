@@ -547,6 +547,24 @@
     return { asOf: Date.parse(payload.data_as_of), periods, current, tolerance };
   };
 
+  // 周额度正好等于这个周期里各个 5 小时窗口的用量之和乘一个固定比例，按模型拆也一样
+  // （Plus、Team 实测都是 1/6.4，也就是用满一个 5 小时窗口 = 周额度的 15.625%）。
+  // 每个周期各算一个，取中位数，以防哪个周期的窗口不全；窗口按开始时刻归属，边界误差用官方的 60 秒
+  const shortToWeekly = (history, minutes, shortMinutes) => {
+    const periods = history?.periods || [];
+    const ratios = periods
+      .filter((w) => w.minutes === minutes && w.used >= 0.05)
+      .map((w) => {
+        const end = Number.isFinite(w.cutAt) ? w.cutAt : w.end;
+        const used = sum(periods.filter((p) => p.minutes === shortMinutes && p.start >= w.start - 60000 && p.start < end), (p) => p.used);
+        return used > EPS ? w.used / used : NaN;
+      })
+      // 比 1 大说明这个周期的窗口缺了
+      .filter((r) => Number.isFinite(r) && r < 1)
+      .sort((a, b) => a - b);
+    return ratios.length ? ratios[Math.floor(ratios.length / 2)] : NaN;
+  };
+
 
   const clampTo = (v, lo, hi) => Math.min(hi, Math.max(lo, n(v)));
   const dayOf = (ms) => utcDayStart(utcDateKey(ms));
@@ -557,6 +575,10 @@
     const asOf = history?.asOf;
     const current = history?.current || null;
     const official = Boolean(current) || (Boolean(history) && Number.isFinite(asOf) && range.start >= asOf);
+    // wham 的 used_percent 是整数，可能比已结算还少零点几；差得更多说明周期对错了，照原样显示
+    const percent = firstPositive(weekly?.used_percent, weekly?.usedPercent) || usedRatio(weekly) * 100;
+    const behind = current ? current.used * 100 - percent : 0;
+    const rounded = behind > 0 && behind < 1;
     const cycles = [
       {
         current: true,
@@ -567,7 +589,8 @@
         settled: current ? current.used : official ? 0 : NaN,
         breakdowns: current?.breakdowns || {},
         cut: false,
-        live: usedRatio(weekly),
+        live: rounded ? current.used : usedRatio(weekly),
+        livePercent: rounded ? current.used * 100 : percent,
       },
     ];
     (history?.periods || [])
@@ -780,8 +803,22 @@
     return [...map.values()];
   };
 
+  // 每个 5 小时窗口最多用掉周额度的 ratio，窗口又要等第一次使用才开始计时，所以剩下的周额度最快也要再等几个窗口。
+  // 返回最早用完的时刻，以及到 until 为止最多能用到多少
+  const shortCeiling = (live, sw, ratio, now, until) => {
+    if (!sw || !(ratio > 0) || !(sw.minutes > 0)) return null;
+    const len = sw.minutes * 60000;
+    const active = !sw.idle && Number.isFinite(sw.reset) && sw.reset > now;
+    const room = active ? Math.max(0, 1 - sw.used) * ratio : 0;
+    const next = active ? sw.reset : now;
+    const need = 1 - live;
+    const earliest = need <= room + EPS ? now : next + (Math.ceil((need - room) / ratio - EPS) - 1) * len;
+    const reach = live + room + Math.max(0, Math.ceil((until - next) / len)) * ratio;
+    return { earliest, reach };
+  };
+
   const buildView = (data, index) => {
-    const { mode, usage, weekly, short, history, now, cycles, quota, minutes } = data;
+    const { mode, usage, short, history, now, cycles, quota, minutes, shortRatio } = data;
     const c = cycles[index];
     const asOf = history?.asOf;
     const days = [...c.days].sort((a, b) => a.ts - b.ts);
@@ -791,8 +828,8 @@
     // 过去的周期没有实时值；结束时间晚于结算截止的，用每日明细里还没结算的 credits 估出剩下那段
     const unsettledUnits = !c.current && Number.isFinite(asOf) ? sum(days.filter((d) => d.ts + DAY_MS > asOf), unitsOf) : 0;
     const estimated = !c.current && hasSettled && quota > EPS ? unsettledUnits / quota : 0;
-    const live = c.current ? usedRatio(weekly) : Math.max(0, n(settled)) + estimated;
-    const livePercent = c.current ? firstPositive(weekly?.used_percent, weekly?.usedPercent) || live * 100 : live * 100;
+    const live = c.current ? c.live : Math.max(0, n(settled)) + estimated;
+    const livePercent = c.current ? c.livePercent : live * 100;
     const pending = c.current ? (hasSettled ? Math.max(0, live - settled) : 0) : estimated;
 
     const models = aggregateModels(days);
@@ -856,19 +893,6 @@
     const projectionBase = hasSettled ? settled * coveredShare : live;
     const projectedUsd = !c.partial && projectionBase > EPS && coveredUsd > 0 ? coveredUsd / projectionBase : NaN;
 
-    let elapsed = NaN;
-    let exhaustAt = NaN;
-    let endRatio = NaN;
-    if (c.current) {
-      const span = range.end - range.start;
-      elapsed = range.known && span > 0 ? clamp01((now - range.start) / span) : NaN;
-      if (Number.isFinite(elapsed) && elapsed > 0.02 && live > 0.01) {
-        const at = range.start + (now - range.start) / live;
-        if (at < range.end) exhaustAt = at;
-        endRatio = live / elapsed;
-      }
-    }
-
     // 窗口要等第一次使用才开始计时，没开始时 reset_after_seconds 等于整个窗口长度
     const shortWindow =
       c.current && short
@@ -880,6 +904,24 @@
             idle: usedRatio(short) <= 0 && Math.abs(n(short.reset_after_seconds) - windowSeconds(short)) < 60,
           }
         : null;
+
+    let elapsed = NaN;
+    let exhaustAt = NaN;
+    let endRatio = NaN;
+    let exhaustCapped = false;
+    if (c.current) {
+      const span = range.end - range.start;
+      elapsed = range.known && span > 0 ? clamp01((now - range.start) / span) : NaN;
+      if (Number.isFinite(elapsed) && elapsed > 0.02 && live > 0.01) {
+        const at = range.start + (now - range.start) / live;
+        // 按平均速度外推可能比 5 小时窗口允许的还快（比如刚开始就把一个窗口用满了），取两者中晚的那个
+        const ceiling = shortCeiling(live, shortWindow, shortRatio, now, range.end);
+        exhaustCapped = Boolean(ceiling) && ceiling.earliest > at;
+        const when = exhaustCapped ? ceiling.earliest : at;
+        if (when < range.end) exhaustAt = when;
+        endRatio = Math.min(live / elapsed, ceiling ? ceiling.reach : Infinity);
+      }
+    }
 
     const extraLimits = !c.current
       ? []
@@ -905,7 +947,8 @@
       tokens: sum(days, (d) => d.total),
       usd: sum(days, (d) => d.usd),
       projectedUsd,
-      elapsed, exhaustAt, endRatio,
+      elapsed, exhaustAt, endRatio, exhaustCapped: exhaustCapped && Number.isFinite(exhaustAt), shortRatio,
+      blocked: Boolean(shortWindow) && shortWindow.used >= 1 && Number.isFinite(shortWindow.reset) && shortWindow.reset > now,
       shortWindow, extraLimits, periods,
       sources: asArray(c.breakdowns?.thread_source).filter((r) => r.ratio > 0.00005),
       missingDays: days.filter((d) => d.missingTokens).length,
@@ -932,7 +975,9 @@
     cycles.forEach((c) => {
       c.partial = c.start < firstTs;
     });
-    return { mode: daily.mode, usage, weekly, short, history, now, cycles, quota, days: daily.days, minutes: windowSeconds(weekly) / 60 || 10080 };
+    const minutes = windowSeconds(weekly) / 60 || 10080;
+    const shortRatio = short ? shortToWeekly(history, minutes, windowSeconds(short) / 60) : NaN;
+    return { mode: daily.mode, usage, weekly, short, history, now, cycles, quota, shortRatio, days: daily.days, minutes };
   }
 
 
@@ -992,13 +1037,20 @@
       return ended + lag;
     }
     if (v.live >= 1) return `本周额度已用完，${esc(fmtTime(v.range.end))} 重置。`;
+    const short = v.shortWindow ? esc(fmtWindow(v.shortWindow.minutes)) : "";
+    // 5 小时额度用完时，这时最要紧的是几点能接着用；后面那句说的就是周额度了
+    const blocked = v.blocked ? `${short}额度已用完，${esc(fmtClock(v.shortWindow.reset))} 恢复。` : "";
     if (Number.isFinite(v.exhaustAt)) {
-      return `照现在的速度，额度会在 ${esc(fmtTime(v.exhaustAt))} 左右用完，比重置早 ${esc(fmtDuration(v.range.end - v.exhaustAt))}。`;
+      const early = `比重置早 ${esc(fmtDuration(v.range.end - v.exhaustAt))}`;
+      if (v.exhaustCapped) {
+        return `${blocked}${blocked ? "之后" : `受 ${short}额度限制，`}就算每个窗口都用满，周额度最早也要 ${esc(fmtTime(v.exhaustAt))} 才会用完，${early}。`;
+      }
+      return `${blocked}照现在的速度，${blocked ? "周额度" : "额度"}会在 ${esc(fmtTime(v.exhaustAt))} 左右用完，${early}。`;
     }
     if (Number.isFinite(v.endRatio)) {
-      return `照现在的速度，到 ${esc(fmtTime(v.range.end))} 重置时大约用掉 ${fmtPct(Math.min(v.endRatio, 1))}。`;
+      return `${blocked}照现在的速度，到 ${esc(fmtTime(v.range.end))} 重置时${blocked ? "周额度" : ""}大约用掉 ${fmtPct(Math.min(v.endRatio, 1))}。`;
     }
-    return v.range.known ? `${esc(fmtTime(v.range.end))} 重置。` : "";
+    return v.range.known ? `${blocked}${blocked ? "周额度 " : ""}${esc(fmtTime(v.range.end))} 重置。` : blocked;
   };
 
   const renderHero = (v) => {
@@ -1040,7 +1092,9 @@
       : v.hasSettled
       ? `
         <div class="ql-key"><span class="ql-swatch" style="background:${swatchSettled}"></span>已结算 <b>${fmtPct(v.settled)}</b>${
-          Number.isFinite(v.asOf) ? `<span class="ql-key-note">截至 ${esc(fmtTime(v.asOf))}</span>` : ""
+          !Number.isFinite(v.asOf)
+            ? ""
+            : `<span class="ql-key-note">${v.asOf <= v.range.start ? "官网还没结算到本周期" : `截至 ${esc(fmtTime(v.asOf))}`}</span>`
         }</div>
         <div class="ql-key"><span class="ql-swatch ql-swatch-pending"></span>尚未结算 <b>${fmtPct(v.pending)}</b></div>
         <div class="ql-key"><span class="ql-swatch ql-swatch-empty"></span>剩余 <b>${fmtPct(Math.max(0, 1 - v.live))}</b></div>`
@@ -1269,7 +1323,7 @@
     return fold("days", "每日明细", `${v.days.length} 天`, body, folds);
   };
 
-  const renderMethod = (folds) =>
+  const renderMethod = (v, folds) =>
     fold(
       "method",
       "这些数字怎么来的",
@@ -1277,6 +1331,11 @@
       `<ul class="ql-method">
         <li>实时已用来自 ChatGPT 的限额接口，随用随变。</li>
         <li>已结算来自官网「套餐用量历史」，按 UTC 整点结算，所以会比实时少一截；两者之差就是还没结算的用量。</li>
+        <li>用完时间按本周期到现在的平均速度外推。${
+          Number.isFinite(v.shortRatio)
+            ? `按官网历史，用满一个 5 小时窗口正好消耗周额度的 ${fmtPct(v.shortRatio)}，所以预测不会早于每个窗口都用满时最早能用完的时刻。`
+            : ""
+        }</li>
         <li>各模型占周额度是官网数据；同一模型的 Standard 与 Fast 按当天的额度消耗比例拆开。</li>
         <li>Token 来自每日统计。Team 工作区直接给出每个模型的 Token；个人账号每天只有合计，多个模型时按各模型费率反推分配，所以是估算。</li>
         <li>金额按 OpenAI API 公开价格折算，Fast 按 2.5 倍、Ultrafast 按 8 倍，只是等价参考，不是账单。</li>
@@ -1305,7 +1364,7 @@
         ${renderWindows(v, folds)}
         ${renderSources(v, folds)}
         ${renderDays(v, folds)}
-        ${renderMethod(folds)}
+        ${renderMethod(v, folds)}
       </div>
       ${renderFooter()}`;
   };
@@ -1352,7 +1411,8 @@
           return masked;
         }
       }
-      if (/@/.test(value) || /^[\w-]{24,}$/.test(value)) return masked;
+      // 长串多半是 ID；但全小写、用下划线连起来的单词是枚举值（比如 thread_source），留着
+      if (/@/.test(value) || (/^[\w-]{24,}$/.test(value) && !/^[a-z]+(_[a-z]+)+$/.test(value))) return masked;
       if (/email|name|user|account|org|workspace|id$|_id|token|phone|avatar|picture|session/i.test(key) && !/model|limit|window|units|speed/i.test(key)) {
         return masked;
       }
@@ -1408,7 +1468,7 @@
             );
           const of = (minutes) => asArray(body?.periods).filter((p) => n(p?.window_minutes) === minutes);
           sample.weekly = of(10080).map((p) => [p.starts_at, p.ends_at, bp(p.used_basis_points), Boolean(p.accounting_complete), models(p)]);
-          sample.short = of(300).map((p) => [p.starts_at, p.ends_at, bp(p.used_basis_points), models(p)]);
+          sample.short = of(300).map((p) => [p.starts_at, p.ends_at, bp(p.used_basis_points), Boolean(p.accounting_complete), models(p)]);
         }
         samples.push(sample);
       } catch (error) {
@@ -1421,13 +1481,15 @@
     // 有绝对 credits 时换算成 credits，没有时（Team）就是每日明细里的相对值
     const computed = state
       ? (() => {
-          const { quota, cycles, days, mode } = state.data;
+          const { quota, cycles, days, mode, shortRatio } = state.data;
           const scale = creditScale(days);
           const amount = (u) => (Number.isFinite(scale) ? round(u * scale) : round(u, 100));
           return {
             mode,
             unit: Number.isFinite(scale) ? "credits" : "relative",
             per100: amount(quota),
+            // 用满一个 5 小时窗口合多少周额度（Plus、Team 是 0.15625）
+            shortRatio: round(shortRatio, 1e5),
             cycles: cycles.map((c) => ({
               start: iso(c.start),
               end: iso(c.end),
