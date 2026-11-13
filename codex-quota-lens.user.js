@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex 额度透镜
 // @namespace    codex-quota-lens
-// @version      1.4
+// @version      1.5
 // @description  在 ChatGPT 用量页查看 Codex 周额度：实时与已结算用量、用量节奏、各模型与来源占比，以及折合 API 价格的估算。
 // @author       Wren, Claude
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   if (window.__codexQuotaLens) return;
   window.__codexQuotaLens = true;
 
-  const VERSION = "1.4";
+  const VERSION = "1.5";
   const TARGET_PATHS = ["/settings/usage", "/codex/cloud/settings/analytics"];
   const DAY_MS = 86400000;
   const WEEK_SECONDS = 604800;
@@ -587,6 +587,7 @@
         until: Math.min(range.end, now),
         known: range.known,
         settled: current ? current.used : official ? 0 : NaN,
+        incomplete: current?.complete === false,
         breakdowns: current?.breakdowns || {},
         cut: false,
         live: rounded ? current.used : usedRatio(weekly),
@@ -604,6 +605,7 @@
           until: Math.min(end, now),
           known: true,
           settled: p.used,
+          incomplete: p.complete === false,
           breakdowns: p.breakdowns,
           cut: Number.isFinite(p.cutAt),
           live: p.used,
@@ -831,6 +833,15 @@
     const live = c.current ? c.live : Math.max(0, n(settled)) + estimated;
     const livePercent = c.current ? c.livePercent : live * 100;
     const pending = c.current ? (hasSettled ? Math.max(0, live - settled) : 0) : estimated;
+    const canSplitAmounts = hasSettled && Number.isFinite(asOf);
+    const settledDays = days.filter((d) => !Number.isFinite(asOf) || d.ts < asOf);
+    const unsettledDays = days.filter((d) => Number.isFinite(asOf) && d.ts >= asOf);
+    const amountParts = canSplitAmounts
+      ? [settledDays, unsettledDays].map((part) => ({
+          usd: sum(part, (d) => d.usd), total: sum(part, (d) => d.total),
+          unknownPricing: part.some((d) => d.unknownPricing),
+        }))
+      : null;
 
     const models = aggregateModels(days);
     const totalCredits = sum(models, (m) => m.credits);
@@ -885,7 +896,17 @@
       m.color = colorOf.get(m.model);
     });
 
-    const settledDays = days.filter((d) => !Number.isFinite(asOf) || d.ts < asOf);
+    if (canSplitAmounts) {
+      const parts = [settledDays, unsettledDays].map((part) => new Map(
+        aggregateModels(part).map((m) => [`${m.model}|${m.speed}`, m]),
+      ));
+      models.forEach((m) => {
+        m.amountParts = parts.map((part) => part.get(`${m.model}|${m.speed}`) || {
+          model: m.model, speed: m.speed, input: 0, cached: 0, output: 0, total: 0, credits: 0, usd: 0,
+          unknownPricing: false, estimated: false, fallback: false,
+        });
+      });
+    }
     const settledWeight = sum(settledDays, (d) => d.weight);
     const covered = settledDays.filter((d) => !d.missingTokens);
     const coveredShare = settledWeight > EPS ? sum(covered, (d) => d.weight) / settledWeight : 1;
@@ -940,13 +961,13 @@
 
     return {
       mode, range, now, live, livePercent, settled, hasSettled, pending, asOf,
-      current: c.current, cut: c.cut, partial: c.partial, estimated: estimated > 0.0005,
+      current: c.current, cut: c.cut, partial: c.partial, incomplete: c.incomplete, estimated: estimated > 0.0005,
       nav: { index, count: cycles.length },
       models, colorOf, days, quotaApprox,
       quotaTotal: quotaApprox ? base : settled,
       tokens: sum(days, (d) => d.total),
       usd: sum(days, (d) => d.usd),
-      projectedUsd,
+      projectedUsd, projectionBase, amountParts,
       elapsed, exhaustAt, endRatio, exhaustCapped: exhaustCapped && Number.isFinite(exhaustAt), shortRatio,
       blocked: Boolean(shortWindow) && shortWindow.used >= 1 && Number.isFinite(shortWindow.reset) && shortWindow.reset > now,
       shortWindow, extraLimits, periods,
@@ -1129,21 +1150,31 @@
       </section>`;
   };
 
+  const renderAmountParts = (parts) => parts
+    ? `<span class="ql-amount-part">${fmtUsd(parts[0].usd)}${parts[0].unknownPricing ? "*" : ""}（已结算）</span> <span class="ql-amount-part">+ ${fmtUsd(parts[1].usd)}${parts[1].unknownPricing ? "*" : ""}（未结算）</span>`
+    : "无法区分已结算与未结算";
+
   const renderFigures = (v) => {
     const star = v.unknownModels.length ? "*" : "";
     const none = v.partial && !(v.tokens > 0);
+    const projected = Number.isFinite(v.projectedUsd);
+    const basis = projected
+      ? `按${v.hasSettled ? "已结算" : "实时"} ${fmtPct(v.projectionBase)} 周额度${v.hasSettled ? "折算" : "粗估"}`
+      : "";
     return `
       <section class="ql-figures">
-        <div class="ql-figure"><b>${none ? "—" : `${fmtUsd(v.usd)}${star}`}</b><span>折合 API 价格</span></div>
-        <div class="ql-figure"><b>${Number.isFinite(v.projectedUsd) ? `${fmtUsd(v.projectedUsd)}${star}` : "—"}</b><span>${
-          Number.isFinite(v.projectedUsd) ? (v.current ? "整周推算" : "整周额度约合") : "暂无推算"
-        }</span></div>
+        <div class="ql-figure"><b>${none ? "—" : `${fmtUsd(v.usd)}${star}`}</b><span>已统计 API 折合</span>${none ? "" : `<small>${renderAmountParts(v.amountParts)}</small>`}</div>
+        <div class="ql-figure"><b>${projected ? `${fmtUsd(v.projectedUsd)}${star}` : "—"}</b><span>${
+          projected ? "整周额度约合" : "暂无推算"
+        }</span>${basis ? `<small>${esc(basis)}</small>` : ""}</div>
         <div class="ql-figure"><b>${none ? "—" : fmtTokens(v.tokens)}</b><span>已统计 Tokens</span></div>
+        <p class="ql-figures-note">${v.amountParts ? `按官网结算截止时间 ${esc(fmtTime(v.asOf))} 拆分金额。` : ""}未结算金额只含已有 Token 明细的用量，可能还没覆盖全部实时用量。</p>
       </section>`;
   };
 
   const renderNotices = (v) => {
     const notes = [];
+    if (v.incomplete) notes.push("官网提示部分用量不可用，此周期的数据可能不完整，已结算额度与整周推算可能受影响。");
     if (!v.hasSettled) {
       notes.push("没读到官网的已结算数据，各模型占比按实时比例近似（标 ≈），整周推算会偏低。可以在页面底部导出诊断信息排查。");
     }
@@ -1165,7 +1196,7 @@
     return notes.map((t) => `<p class="ql-notice">${t}</p>`).join("");
   };
 
-  const modelDetail = (m) => {
+  const modelCalculation = (m) => {
     const price = priceFor(m.model, m.speed);
     // 价格按每百万计，明细统一用 M；小数位按最小的那一项取够三位有效数字
     const nonzero = [m.input, m.cached, m.output].filter((x) => x > 0);
@@ -1192,11 +1223,21 @@
     return `${parts}<p class="ql-calc">${line} = ${fmtUsd(m.usd)}</p>${notes.length ? `<p>${notes.join("")}</p>` : ""}`;
   };
 
+  const modelDetail = (m) => {
+    if (!m.amountParts) return `<p>没有结算截止时间，暂时无法拆分；以下是全部已统计用量。</p>${modelCalculation(m)}`;
+    return m.amountParts.map((part, i) => `<div class="ql-detail-part">
+      <p class="ql-detail-label">${i === 0 ? "已结算时段" : "未结算时段"}</p>
+      ${part.total > EPS || part.credits > EPS ? modelCalculation(part) : "<p>暂无已统计的 Token 或金额。</p>"}
+    </div>`).join("");
+  };
+
   const renderModels = (v) => {
     if (!v.models.length) {
       return `<section class="ql-block"><h3>模型</h3><p class="ql-empty">本周期还没有已统计的用量，通常次日就会出现。</p></section>`;
     }
     const approx = (m) => (m.approx ? "≈" : "");
+    const quotaLabel = v.quotaApprox ? "估算占周额度" : "已结算周额度";
+    const mobileLabel = `<small class="ql-quota-label">${v.quotaApprox ? "估算" : "已结算"}</small>`;
     const unit = tokenUnit(v.tokens);
     const rows = v.models
       .map(
@@ -1204,9 +1245,9 @@
         <button type="button" class="ql-row" data-row="${i}" aria-expanded="false">
           <span class="ql-dot" style="background:${m.color}"></span>
           <span class="ql-name">${esc(m.model)}${speedLabel(m.speed) ? `<span class="ql-tag">${esc(speedLabel(m.speed))}</span>` : ""}</span>
-          <span class="ql-cell c-quota">${m.unsettled ? `<span title="这部分用量还没进官网结算">—</span>` : `${approx(m)}${fmtPct(m.quota)}`}</span>
+          <span class="ql-cell c-quota">${mobileLabel}${m.unsettled ? `<span title="这部分用量还没进官网结算">—</span>` : `${approx(m)}${fmtPct(m.quota)}`}</span>
           <span class="ql-cell c-tok${m.total > EPS ? "" : " is-none"}">${m.total > EPS ? fmtTokensAs(m.total, unit) : "—"}</span>
-          <span class="ql-cell c-usd">${m.total > EPS && !m.unknownPricing ? fmtUsd(m.usd) : "—"}</span>
+          <span class="ql-cell c-usd">${m.total > EPS && !m.unknownPricing ? fmtUsd(m.usd) : "—"}${m.total > EPS && m.amountParts ? `<small>${renderAmountParts(m.amountParts)}</small>` : ""}</span>
         </button>
         <div class="ql-detail" data-detail="${i}" hidden>${modelDetail(m)}</div>`,
       )
@@ -1215,16 +1256,16 @@
       <section class="ql-block">
         <div class="ql-block-head">
           <h3>模型</h3>
-          <p class="ql-hint">${v.quotaApprox ? "占周额度按实时比例近似" : "占周额度为官网数据"}${v.tokens > 0 ? (v.mode === "team" ? "，金额为估算，点一行看计算" : "，Token 与金额为估算，点一行看计算") : ""}</p>
+          <p class="ql-hint">${v.quotaApprox ? "占周额度为近似值" : "百分比只计已结算用量"}。${v.amountParts ? "金额下方列出已结算与未结算部分，点一行分别看 Token 和计算。" : "没有结算截止时间，金额暂时无法拆分。点一行看计算。"}</p>
         </div>
-        <div class="ql-cols"><span></span><span>模型</span><span>占周额度</span><span>Tokens</span><span>折合金额</span></div>
+        <div class="ql-cols"><span></span><span>模型</span><span>${quotaLabel}</span><span>已统计 Tokens</span><span>已统计金额</span></div>
         <div class="ql-rows">${rows}</div>
         <div class="ql-row ql-row-total">
           <span></span>
           <span class="ql-name">合计</span>
-          <span class="ql-cell c-quota">${v.quotaApprox ? "≈" : ""}${fmtPct(v.quotaTotal)}</span>
+          <span class="ql-cell c-quota">${mobileLabel}${v.quotaApprox ? "≈" : ""}${fmtPct(v.quotaTotal)}</span>
           <span class="ql-cell c-tok${v.tokens > 0 ? "" : " is-none"}">${v.tokens > 0 ? fmtTokensAs(v.tokens, unit) : "—"}</span>
-          <span class="ql-cell c-usd">${v.tokens > 0 ? fmtUsd(v.usd) : "—"}</span>
+          <span class="ql-cell c-usd">${v.tokens > 0 ? fmtUsd(v.usd) : "—"}${v.tokens > 0 && v.amountParts ? `<small>${renderAmountParts(v.amountParts)}</small>` : ""}</span>
         </div>
       </section>`;
   };
@@ -1251,8 +1292,8 @@
                 ? "进行中"
                 : p.complete
                   ? "已结算"
-                  : `<span title="窗口已结束，但官方数据仍标记为未完成核算，数值一般不再变化">未核完</span>`
-          }</span>
+                  : ""
+          }${!p.complete ? `<span class="ql-window-incomplete" title="部分用量不可用；此周期的数据可能不完整">数据可能不完整</span>` : ""}</span>
         </div>`,
       );
     v.extraLimits.forEach((l) =>
@@ -1266,7 +1307,7 @@
     );
     if (!rows.length) return "";
     const hint = v.periods.length
-      ? `来自官网「套餐用量历史」${Number.isFinite(v.asOf) ? `，结算截至 ${esc(fmtTime(v.asOf))}` : ""}。进行中的窗口还会继续增长；「未核完」是官方对个别已结束窗口的标记，多见于用超 100% 的窗口${
+      ? `来自官网「套餐用量历史」${Number.isFinite(v.asOf) ? `，结算截至 ${esc(fmtTime(v.asOf))}` : ""}。「数据可能不完整」表示官网提示部分用量不可用，不代表稍后一定会补齐${
           v.periods.some((p) => Number.isFinite(p.cutAt)) ? "；「已重置」表示额度提前重置，窗口提前结束" : ""
         }。`
       : "没读到官网的套餐用量历史，这里只列出单独计算的限额。";
@@ -1338,8 +1379,8 @@
         }</li>
         <li>各模型占周额度是官网数据；同一模型的 Standard 与 Fast 按当天的额度消耗比例拆开。</li>
         <li>Token 来自每日统计。Team 工作区直接给出每个模型的 Token；个人账号每天只有合计，多个模型时按各模型费率反推分配，所以是估算。</li>
-        <li>金额按 OpenAI API 公开价格折算，Fast 按 2.5 倍、Ultrafast 按 8 倍，只是等价参考，不是账单。</li>
-        <li>整周推算等于已结算时段的金额除以同一时段的已用比例，也就是用满一周额度大约值多少。</li>
+        <li>金额按已有 Token 明细折算，以官网结算截止时间分成已结算与未结算两部分；模型明细也按同一时间拆分 Token 和金额。每日明细与实时额度的更新时间不同，未结算金额不一定覆盖全部未结算用量。按 OpenAI API 公开价格计算，Fast 按 2.5 倍、Ultrafast 按 8 倍，只是等价参考，不是账单。分项分别四舍五入，显示值相加可能与合计相差 $0.01。</li>
+        <li>整周额度约合等于已结算时段的金额除以同一时段的已用比例，仅代表这部分用量的模型、速度和缓存比例。数字下方标出用于推算的周额度比例；没有官网历史时，才用已统计金额除以实时比例粗估，可能偏低。</li>
         <li>每日统计按 UTC 日期分，一天可能跨两个周期（比如提前重置那天）。这时按官网 5 小时窗口的用量把当天拆开（重置会让 5 小时窗口同时结束，所以分得准），Token 和金额跟着拆；还没结算的先用实时用量估，再不行就按时长估。</li>
       </ul>`,
       folds,
@@ -1701,6 +1742,10 @@ html.dark #cql-root, html.dark #cql-launch {
   letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
 }
 #cql-root .ql-figure span { display: block; margin-top: 2px; color: var(--muted); font-size: 12.5px; }
+#cql-root .ql-figure small { display: block; margin: 6px 8px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+#cql-root .ql-amount-part { display: inline-block; max-width: 100%; }
+#cql-root .ql-figure .ql-amount-part { display: inline-block; margin: 0; font-size: inherit; }
+#cql-root .ql-figures-note { grid-column: 1 / -1; margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 
 #cql-root .ql-notice { margin: 14px 28px 0; padding: 10px 14px; border-radius: 12px; background: var(--warn-bg); color: var(--warn); font-size: 13px; }
 
@@ -1711,7 +1756,7 @@ html.dark #cql-root, html.dark #cql-launch {
 #cql-root .ql-empty { margin-top: 8px; color: var(--muted); }
 
 #cql-root .ql-cols, #cql-root .ql-row {
-  display: grid; grid-template-columns: 12px minmax(0, 1fr) 82px 76px 82px; align-items: center; column-gap: 14px;
+  display: grid; grid-template-columns: 12px minmax(0, 1fr) 82px 88px 126px; align-items: center; column-gap: 14px;
 }
 #cql-root .ql-cols { padding: 0 10px 6px; color: var(--faint); font-size: 12px; }
 #cql-root .ql-cols span:nth-child(n + 3) { text-align: right; }
@@ -1729,11 +1774,15 @@ html.dark #cql-root, html.dark #cql-launch {
 }
 #cql-root .ql-cell { text-align: right; }
 #cql-root .c-quota { font-weight: 650; }
+#cql-root .ql-quota-label { display: none; }
 #cql-root .c-tok, #cql-root .c-usd { color: var(--muted); }
+#cql-root .c-usd small { display: block; max-width: 126px; margin: 4px 0 0 auto; color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.6; }
 #cql-root .ql-row-total .c-tok, #cql-root .ql-row-total .c-usd { color: var(--ink); }
 #cql-root .ql-detail { margin: 0 10px 10px 36px; padding: 6px 0 8px; color: var(--muted); font-size: 13px; }
 #cql-root .ql-detail[hidden] { display: none; }
 #cql-root .ql-detail p + p { margin-top: 4px; }
+#cql-root .ql-detail-part + .ql-detail-part { margin-top: 14px; }
+#cql-root .ql-detail-label { margin-bottom: 8px; color: var(--ink); font-weight: 600; }
 #cql-root .ql-parts { display: flex; flex-wrap: wrap; gap: 6px 26px; margin-bottom: 8px; }
 #cql-root .ql-parts span { display: block; font-size: 12px; }
 #cql-root .ql-parts b { display: block; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -1769,6 +1818,7 @@ html.dark #cql-root, html.dark #cql-launch {
 #cql-root .ql-label small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 400; }
 #cql-root .ql-val { text-align: right; font-weight: 650; }
 #cql-root .ql-extra { text-align: right; white-space: nowrap; color: var(--muted); }
+#cql-root .ql-window-incomplete { display: block; font-size: 12px; }
 #cql-root .ql-list-row.is-current .ql-label { color: var(--accent); }
 #cql-root .ql-method { padding-left: 1.1em; color: var(--muted); font-size: 13px; max-width: 46em; }
 #cql-root .ql-method li + li { margin-top: 4px; }
@@ -1829,11 +1879,12 @@ html.dark #cql-root, html.dark #cql-launch {
   #cql-root .ql-dot { grid-area: dot; }
   #cql-root .ql-name { grid-area: name; }
   #cql-root .c-quota { grid-area: quota; }
+  #cql-root .ql-quota-label { display: inline; margin-right: 4px; color: var(--muted); font-size: 11px; font-weight: 400; }
   #cql-root .c-tok { grid-area: tok; text-align: left; font-size: 12.5px; }
   #cql-root .c-tok::after { content: " tokens"; }
   #cql-root .c-tok.is-none::after { content: none; }
   #cql-root .c-usd { grid-area: usd; font-size: 12.5px; }
-  #cql-root .ql-row-total span:first-child { display: none; }
+  #cql-root .ql-row-total > span:first-child { display: none; }
   #cql-root .ql-detail { margin: 0 8px 8px 30px; }
   #cql-root .ql-fold { margin: 0 18px; }
   #cql-root .ql-list-row, #cql-root .ql-list-windows .ql-list-row, #cql-root .ql-list-days .ql-list-row {
