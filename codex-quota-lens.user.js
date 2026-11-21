@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex 额度透镜
 // @namespace    codex-quota-lens
-// @version      1.5
+// @version      1.6
 // @description  在 ChatGPT 用量页查看 Codex 周额度：实时与已结算用量、用量节奏、各模型与来源占比，以及折合 API 价格的估算。
 // @author       Wren, Claude
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   if (window.__codexQuotaLens) return;
   window.__codexQuotaLens = true;
 
-  const VERSION = "1.5";
+  const VERSION = "1.6";
   const TARGET_PATHS = ["/settings/usage", "/codex/cloud/settings/analytics"];
   const DAY_MS = 86400000;
   const WEEK_SECONDS = 604800;
@@ -31,6 +31,8 @@
 
   // 美元 / 1M tokens（OpenAI API 标准价）；fast / ultrafast 为 Codex 订阅额度下相对 Standard 的倍率
   const PRICES = {
+    "gpt-6.2-astra": { input: 8, cached: 0.4, output: 40, fast: 2, ultrafast: 6 },
+    "gpt-6.2-sol": { input: 2, cached: 0.1, output: 10, fast: 2, ultrafast: 6 },
     "gpt-6-astra": { input: 10, cached: 1, output: 50, fast: 2.5, ultrafast: 8 },
     "gpt-6.1-sol": { input: 2, cached: 0.1, output: 10, fast: 2.5, ultrafast: 8 },
     "gpt-6-sol": { input: 2, cached: 0.2, output: 10, fast: 2.5 },
@@ -1379,7 +1381,7 @@
         }</li>
         <li>各模型占周额度是官网数据；同一模型的 Standard 与 Fast 按当天的额度消耗比例拆开。</li>
         <li>Token 来自每日统计。Team 工作区直接给出每个模型的 Token；个人账号每天只有合计，多个模型时按各模型费率反推分配，所以是估算。</li>
-        <li>金额按已有 Token 明细折算，以官网结算截止时间分成已结算与未结算两部分；模型明细也按同一时间拆分 Token 和金额。每日明细与实时额度的更新时间不同，未结算金额不一定覆盖全部未结算用量。按 OpenAI API 公开价格计算，Fast 按 2.5 倍、Ultrafast 按 8 倍，只是等价参考，不是账单。分项分别四舍五入，显示值相加可能与合计相差 $0.01。</li>
+        <li>金额按已有 Token 明细折算，以官网结算截止时间分成已结算与未结算两部分；模型明细也按同一时间拆分 Token 和金额。每日明细与实时额度的更新时间不同，未结算金额不一定覆盖全部未结算用量。按 OpenAI API 公开价格计算，Fast 按 2 到 2.5 倍、Ultrafast 按 6 到 8 倍（看模型），只是等价参考，不是账单。分项分别四舍五入，显示值相加可能与合计相差 $0.01。</li>
         <li>整周额度约合等于已结算时段的金额除以同一时段的已用比例，仅代表这部分用量的模型、速度和缓存比例。数字下方标出用于推算的周额度比例；没有官网历史时，才用已统计金额除以实时比例粗估，可能偏低。</li>
         <li>每日统计按 UTC 日期分，一天可能跨两个周期（比如提前重置那天）。这时按官网 5 小时窗口的用量把当天拆开（重置会让 5 小时窗口同时结束，所以分得准），Token 和金额跟着拆；还没结算的先用实时用量估，再不行就按时长估。</li>
       </ul>`,

@@ -54,7 +54,7 @@
 ## 估算说明
 
 - 个人账号的每日统计只有 Token 合计。一天里用了多个模型时，脚本按各模型的费率把合计反推分配到每个模型，所以模型级的 Token 和金额是估算值。
-- 金额按 OpenAI API 标准价折算，Fast 按 2.5 倍、Ultrafast 按 8 倍（Codex 订阅额度口径）。它只是等价参考，不是账单。价格表在脚本开头的 `PRICES` 里，来源是 [OpenAI API 定价](https://developers.openai.com/api/docs/pricing) 和 [Codex 速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)。
+- 金额按 OpenAI API 标准价折算，Fast 按 2 到 2.5 倍、Ultrafast 按 6 到 8 倍（看模型，Codex 订阅额度口径）。它只是等价参考，不是账单。价格表在脚本开头的 `PRICES` 里，来源是 [OpenAI API 定价](https://developers.openai.com/api/docs/pricing) 和 [Codex 速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)。
 - 已统计 API 折合金额以已有 Token 明细为准，数字下方显示「已结算金额 + 未结算金额」。两部分按官网结算截止时间划分，模型明细里的 Token 和金额也按同一时间拆分。每日明细可能晚于实时额度更新，因此未结算金额不一定覆盖全部未结算用量，不能直接用合计金额除以实时已用比例推算整周。读不到结算截止时间时，不拆分金额。
 - 整周额度约合 = 已结算时段的金额 ÷ 同一时段的已用比例。数字下方注明用于推算的周额度比例；结果仅代表这部分用量的模型、速度和缓存比例。没有官网历史时，改用已统计金额除以实时比例粗估，可能偏低。
 - 官网提示部分用量不可用的窗口标为「数据可能不完整」，不表示只是等待核算，也不保证之后会补齐。每周窗口有这一标记时，面板也会提示已结算额度与整周推算可能受影响。
